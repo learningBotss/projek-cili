@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chili Stress Detection Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .card-title {
+            font-size: 1.3em;
+            color: #333;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+
+        .card-icon {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        /* Status Indicators */
+        .status-badge {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            margin: 5px 0;
+            font-size: 0.95em;
+        }
+
+        .status-good {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .status-warning {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+
+        .status-danger {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        /* Sensor Data */
+        .sensor-value {
+            font-size: 2.5em;
+            font-weight: 700;
+            color: #667eea;
+            margin: 15px 0;
+        }
+
+        .sensor-label {
+            color: #666;
+            font-size: 0.95em;
+            margin-top: 5px;
+        }
+
+        /* Progress Bar */
+        .progress-bar {
+            width: 100%;
+            height: 12px;
+            background: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            border-radius: 10px;
+            transition: width 0.3s ease;
+        }
+
+        /* Action Buttons */
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.95em;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: scale(1.02);
+        }
+
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #218838;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .btn-warning {
+            background: #ffc107;
+            color: black;
+        }
+
+        .btn-warning:hover {
+            background: #e0a800;
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        /* Chart Container */
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        .history-table th {
+            background: #f8f9fa;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            color: #333;
+            border-bottom: 2px solid #ddd;
+        }
+
+        .history-table td {
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .history-table tr:hover {
+            background: #f8f9fa;
+        }
+
+        /* Alert Box */
+        .alert-box {
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+            border-left: 4px solid;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            border-color: #28a745;
+            color: #155724;
+        }
+
+        .alert-warning {
+            background: #fff3cd;
+            border-color: #ffc107;
+            color: #856404;
+        }
+
+        .alert-danger {
+            background: #f8d7da;
+            border-color: #dc3545;
+            color: #721c24;
+        }
+
+        .alert-info {
+            background: #d1ecf1;
+            border-color: #17a2b8;
+            color: #0c5460;
+        }
+
+        /* Footer */
+        .footer {
+            text-align: center;
+            color: white;
+            margin-top: 40px;
+            padding: 20px;
+            opacity: 0.8;
+        }
+
+        /* Loading spinner */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8em;
+            }
+
+            .sensor-value {
+                font-size: 2em;
+            }
+
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌶️ Chili Stress Detection System</h1>
+            <p>Real-time monitoring and automated plant care</p>
+        </div>
+
+        <div class="dashboard">
+            <!-- Soil Moisture Card -->
+            <div class="card">
+                <div class="card-icon">💧</div>
+                <div class="card-title">Soil Moisture</div>
+                <div class="sensor-value" id="soilPercent">--</div>
+                <div class="sensor-label">Moisture Level (%)</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="soilProgressBar" style="width: 50%"></div>
+                </div>
+                <div class="status-badge" id="soilStatus">LOADING</div>
+            </div>
+
+            <!-- Leaf Health Card -->
+            <div class="card">
+                <div class="card-icon">🍃</div>
+                <div class="card-title">Leaf Health</div>
+                <div class="sensor-value" id="leafHealth">--</div>
+                <div class="sensor-label">Health Score (%)</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="leafProgressBar" style="width: 50%"></div>
+                </div>
+                <div id="leafAnalysis"></div>
+            </div>
+
+            <!-- Disease Detection Card -->
+            <div class="card">
+                <div class="card-icon">🔍</div>
+                <div class="card-title">Disease Detection</div>
+                <div id="diagnosis" style="font-size: 1.3em; color: #333; margin: 15px 0; font-weight: 600;">--</div>
+                <div id="confidence" style="color: #666; margin-bottom: 10px;">Confidence: --</div>
+                <div id="diseaseStatus"></div>
+            </div>
+
+            <!-- Last Check Card -->
+            <div class="card">
+                <div class="card-icon">⏰</div>
+                <div class="card-title">Last Check</div>
+                <div id="lastCheck" style="font-size: 1.2em; color: #667eea; margin: 15px 0;">--</div>
+                <div id="autoCheckTime" style="color: #666; font-size: 0.95em;">Auto-check every 30 minutes</div>
+                <button class="btn btn-primary" onclick="manualCheck()" style="margin-top: 15px; width: 100%;">
+                    Manual Check Now
+                </button>
+            </div>
+
+            <!-- System Status Card -->
+            <div class="card">
+                <div class="card-icon">⚙️</div>
+                <div class="card-title">System Status</div>
+                <div id="systemStatus"></div>
+                <div class="button-group">
+                    <button class="btn btn-success" onclick="testWaterPump()" id="waterPumpBtn">Test Water</button>
+                    <button class="btn btn-warning" onclick="testFertilizerPump()" id="fertilizerPumpBtn">Test Fertilizer</button>
+                </div>
+            </div>
+
+            <!-- Decision History Card -->
+            <div class="card">
+                <div class="card-icon">📊</div>
+                <div class="card-title">Statistics</div>
+                <div id="stats"></div>
+            </div>
+
+            <!-- Alert Box -->
+            <div class="card full-width" id="alertContainer" style="display: none;">
+                <div id="alertContent"></div>
+            </div>
+
+            <!-- History Table -->
+            <div class="card full-width">
+                <div class="card-title">Recent Activity</div>
+                <table class="history-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Soil %</th>
+                            <th>Diagnosis</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historyTable">
+                        <tr>
+                            <td colspan="4" style="text-align: center; color: #999;">No data yet</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>Chili Stress Detection System v1.0 | UiTM Faculty of Computer and Mathematical Sciences</p>
+        </div>
+    </div>
+
+    <script>
+        // ========== CONFIGURATION ==========
+        // CHANGE THIS TO YOUR BACKEND SERVER URL
+        const BACKEND_URL = "http://localhost:5000"; // Local testing
+        // For production: "https://your-app.render.com"
+
+        // ========== AUTO-REFRESH INTERVAL ==========
+        let autoRefreshInterval = 30 * 60 * 1000; // 30 minutes
+        let lastCheckTime = null;
+
+        // ========== FETCH DATA ==========
+        async function fetchData() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/history`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                
+                const data = await response.json();
+                updateDashboard(data);
+            } catch (error) {
+                console.error("Fetch error:", error);
+                showAlert("danger", "Cannot connect to backend. Make sure it's running.");
+            }
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/stats`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                
+                const stats = await response.json();
+                updateStats(stats);
+            } catch (error) {
+                console.error("Stats fetch error:", error);
+            }
+        }
+
+        // ========== UPDATE DASHBOARD ==========
+        function updateDashboard(data) {
+            if (!data.data || data.data.length === 0) {
+                showAlert("info", "No data yet. Waiting for first ESP32 detection...");
+                return;
+            }
+
+            const latest = data.data[data.data.length - 1];
+
+            // Update Soil Moisture
+            const soilPercent = Math.round(latest.soil_percent);
+            document.getElementById('soilPercent').textContent = soilPercent + '%';
+            document.getElementById('soilProgressBar').style.width = soilPercent + '%';
+            
+            const soilStatus = document.getElementById('soilStatus');
+            if (soilPercent > 70) {
+                soilStatus.textContent = 'DRY';
+                soilStatus.className = 'status-badge status-danger';
+            } else if (soilPercent > 40) {
+                soilStatus.textContent = 'NORMAL';
+                soilStatus.className = 'status-badge status-good';
+            } else {
+                soilStatus.textContent = 'WET';
+                soilStatus.className = 'status-badge status-good';
+            }
+
+            // Update Leaf Health
+            const healthScore = Math.round(latest.leaf_stress ? (100 - latest.leaf_stress * 100) : 100);
+            document.getElementById('leafHealth').textContent = healthScore + '%';
+            document.getElementById('leafProgressBar').style.width = healthScore + '%';
+
+            // Update Disease Detection
+            document.getElementById('diagnosis').textContent = latest.diagnosis;
+            const confidence = Math.round(latest.disease_confidence * 100);
+            document.getElementById('confidence').textContent = `Confidence: ${confidence}%`;
+
+            const diseaseStatus = document.getElementById('diseaseStatus');
+            if (latest.has_disease) {
+                diseaseStatus.innerHTML = '<div class="status-badge status-danger">⚠️ DISEASE DETECTED</div>';
+            } else {
+                diseaseStatus.innerHTML = '<div class="status-badge status-good">✓ HEALTHY</div>';
+            }
+
+            // Update Last Check
+            const checkTime = new Date(latest.timestamp);
+            document.getElementById('lastCheck').textContent = checkTime.toLocaleTimeString();
+            lastCheckTime = checkTime;
+
+            // Update System Status
+            let statusHTML = '<div>';
+            if (latest.action_water) {
+                statusHTML += '<div class="alert-box alert-warning">💧 Water pump was activated</div>';
+            }
+            if (latest.action_fertilize) {
+                statusHTML += '<div class="alert-box alert-warning">🌱 Fertilizer pump was activated</div>';
+            }
+            if (latest.alert_disease) {
+                statusHTML += '<div class="alert-box alert-danger">🚨 Disease alert triggered</div>';
+            }
+            if (!latest.action_water && !latest.action_fertilize && !latest.alert_disease) {
+                statusHTML += '<div class="alert-box alert-success">✓ All systems normal</div>';
+            }
+            statusHTML += '</div>';
+            document.getElementById('systemStatus').innerHTML = statusHTML;
+
+            // Update History Table
+            updateHistoryTable(data.data);
+
+            // Show alert if there's a disease
+            if (latest.alert_disease) {
+                showAlert("danger", `⚠️ ALERT: ${latest.diagnosis} detected! Confidence: ${confidence}%`);
+            }
+        }
+
+        function updateStats(stats) {
+            const statsHTML = `
+                <div style="line-height: 2;">
+                    <div><strong>Total Checks:</strong> ${stats.total_checks}</div>
+                    <div><strong>Avg Soil Moisture:</strong> ${Math.round(stats.avg_soil_moisture)}%</div>
+                    <div><strong>Avg Leaf Stress:</strong> ${Math.round(stats.avg_leaf_stress * 100)}%</div>
+                    <div><strong>Disease Alerts:</strong> ${stats.disease_alerts_count}</div>
+                </div>
+            `;
+            document.getElementById('stats').innerHTML = statsHTML;
+        }
+
+        function updateHistoryTable(records) {
+            const tableBody = document.getElementById('historyTable');
+            tableBody.innerHTML = '';
+
+            // Show last 10 records
+            records.slice(-10).reverse().forEach(record => {
+                const time = new Date(record.timestamp);
+                const actions = [];
+                if (record.action_water) actions.push('💧 Water');
+                if (record.action_fertilize) actions.push('🌱 Fert');
+                if (record.alert_disease) actions.push('🚨 Alert');
+                if (actions.length === 0) actions.push('—');
+
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${time.toLocaleTimeString()}</td>
+                    <td>${Math.round(record.soil_percent)}%</td>
+                    <td>${record.diagnosis}</td>
+                    <td>${actions.join(', ')}</td>
+                `;
+                tableBody.appendChild(row);
+            });
+        }
+
+        // ========== USER ACTIONS ==========
+        async function manualCheck() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Checking...';
+            btn.innerHTML = '<span class="loading"></span> Checking...';
+
+            // Note: In real scenario, ESP32 would trigger this
+            // For now, we just refresh the dashboard
+            await fetchData();
+            await fetchStats();
+
+            btn.disabled = false;
+            btn.textContent = 'Manual Check Now';
+        }
+
+        function testWaterPump() {
+            showAlert("info", "💧 Water pump test: Activate for 10 seconds (check your system)");
+        }
+
+        function testFertilizerPump() {
+            showAlert("info", "🌱 Fertilizer pump test: Activate for 5 seconds (check your system)");
+        }
+
+        function showAlert(type, message) {
+            const container = document.getElementById('alertContainer');
+            const content = document.getElementById('alertContent');
+            
+            const alertClass = `alert-${type}`;
+            content.innerHTML = `<div class="alert-box ${alertClass}">${message}</div>`;
+            container.style.display = 'block';
+
+            // Auto-hide after 10 seconds
+            setTimeout(() => {
+                container.style.display = 'none';
+            }, 10000);
+        }
+
+        // ========== INITIALIZATION ==========
+        function init() {
+            fetchData();
+            fetchStats();
+
+            // Auto-refresh every 30 seconds (for dashboard display)
+            setInterval(() => {
+                fetchData();
+                fetchStats();
+            }, 30000);
+
+            console.log("Dashboard initialized");
+            showAlert("info", "✓ Dashboard ready. Waiting for ESP32 data...");
+        }
+
+        // Start when page loads
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>

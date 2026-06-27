@@ -1,5 +1,5 @@
 """
-CHILI STRESS DETECTION BACKEND - PYTHON FLASK
+CHILI STRESS DETECTION BACKEND - PYTHON FLASK (SPLIT DATA VERSION)
 UiTM ITT569 IoT Final Project - CDCS259
 """
 
@@ -22,65 +22,120 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== LOAD PRE-TRAINED MODEL ==========
-# Padan tepat dengan model yang di-train menggunakan folder Pepper__bell dari Kaggle PlantVillage
 MODEL_PATH = "plant_disease_model.h5"
-CLASS_NAMES = [
-    "Chili Bell Bacterial Spot",  # Indeks 0 (Sakit - ikut turutan abjad folder dataset)
-    "Chili Bell Healthy"          # Indeks 1 (Sihat)
-]
+CLASS_NAMES = ["Chili Bell Bacterial Spot", "Chili Bell Healthy"]
 
-# Cuba load model, kalau fail .h5 belum di-push, guna OpenCV fallback automatik
 try:
     if os.path.exists(MODEL_PATH):
         model = tf.keras.models.load_model(MODEL_PATH)
-        logger.info("Model TensorFlow (.h5) berjaya dikesan dan di-load!")
+        logger.info("Model TensorFlow (.h5) berjaya dikesan!")
         model_available = True
     else:
-        logger.warning("Fail plant_disease_model.h5 tiada. Menggunakan OpenCV Fallback.")
+        logger.warning("Fail model tiada. Menggunakan OpenCV Fallback.")
         model_available = False
 except Exception as e:
     logger.warning(f"Gagal load model: {str(e)}. Menggunakan OpenCV fallback.")
     model_available = False
 
-# ========== SENSOR THRESHOLDS ==========
-MOISTURE_THRESHOLD_DRY = 70.0  # % - Atas nilai ni = tanah kering
+MOISTURE_THRESHOLD_DRY = 70.0
 
-# ========== LATEST IMAGE STORAGE ==========
-latest_image = None  # Simpan image binari
-latest_image_base64 = None  # Simpan base64 untuk HTML display
+# Simpanan state global terkini
+latest_soil_percent = 50.0
+latest_soil_raw = 2500
+latest_image = None
+latest_image_base64 = None
 latest_image_timestamp = None
 
-# ========== DATABASE SIMULATION (In-memory) ==========
+# Cache keputusan analisa terakhir dari kamera
+latest_diagnosis = "Chili Bell Healthy"
+latest_confidence = 0.90
+latest_has_disease = False
+latest_leaf_analysis = {"stress_level": 0.0, "color_abnormal": False, "green_ratio": 0.5, "health_score": 100.0}
+
 sensor_history = []
 max_history = 100
+
+def run_smart_logic():
+    """Fungsi pusat untuk proses matriks keputusan fertigasi pintar"""
+    global sensor_history
+    
+    action_water = False
+    action_fertilize = False
+    alert_disease = False
+    decision_reason = ""
+    
+    soil_is_dry = latest_soil_percent > MOISTURE_THRESHOLD_DRY
+    leaf_is_stressed = latest_leaf_analysis['stress_level'] > 0.5
+    leaf_color_changed = latest_leaf_analysis['color_abnormal']
+    
+    hari_sekarang = datetime.now().weekday()
+    hari_baja = [0, 3] # Isnin & Khamis (2 kali seminggu)
+    
+    if soil_is_dry:
+        if (hari_sekarang in hari_baja) and (leaf_is_stressed or latest_diagnosis == "Chili Bell Bacterial Spot"):
+            action_fertilize = True
+            decision_reason = "Tanah Kering + Daun Stres/Sakit + [HARI BAJA] -> Pam Baja Hidup"
+        else:
+            action_water = True
+            decision_reason = "Tanah Kering -> Pam Air Hidup untuk selamatkan pokok"
+            
+    elif not soil_is_dry and (leaf_is_stressed or latest_diagnosis == "Chili Bell Bacterial Spot"):
+        if hari_sekarang in hari_baja:
+            action_fertilize = True
+            decision_reason = "Tanah OK + Daun Stres/Sakit + [HARI BAJA] -> Pam Baja Hidup"
+        else:
+            decision_reason = "Tanah OK + Daun Stres/Sakit TAPI [BUKAN HARI BAJA] -> Pam Ditahan"
+    
+    if leaf_color_changed or latest_has_disease or latest_diagnosis == "Chili Bell Bacterial Spot":
+        alert_disease = True
+        decision_reason += f" | AMARAN PENYAKIT: {latest_diagnosis}"
+    
+    if not action_water and not action_fertilize and not alert_disease:
+        decision_reason = "Semua parameter normal - Pokok Cili Sihat!"
+        
+    record = {
+        "timestamp": datetime.now().isoformat(),
+        "soil_percent": latest_soil_percent,
+        "soil_raw": latest_soil_raw,
+        "diagnosis": latest_diagnosis,
+        "disease_confidence": latest_confidence,
+        "leaf_stress": latest_leaf_analysis['stress_level'],
+        "leaf_color_normal": not latest_leaf_analysis['color_abnormal'],
+        "action_water": action_water,
+        "action_fertilize": action_fertilize,
+        "alert_disease": alert_disease,
+        "decision_reason": decision_reason
+    }
+    sensor_history.append(record)
+    if len(sensor_history) > max_history:
+        sensor_history.pop(0)
 
 # ========== ROUTES ==========
 
 @app.route('/', methods=['GET'])
 def index():
-    """Buka dashboard terus secara online melalui URL Render"""
     return render_template('dashboard.html')
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint untuk Render monitor"""
-    return jsonify({
-        "status": "OK",
-        "model_loaded": model_available,
-        "timestamp": datetime.now().isoformat()
-    }), 200
+@app.route('/soil', methods=['POST'])
+def receive_soil():
+    """Endpoint baru untuk terima data tanah dari ESP32 Biasa"""
+    global latest_soil_percent, latest_soil_raw
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data received"}), 400
+    
+    latest_soil_raw = data.get('soil_raw', 2500)
+    latest_soil_percent = data.get('soil_percent', 50.0)
+    
+    # Setiap kali data tanah baru masuk, kemaskini logik keputusan
+    run_smart_logic()
+    return jsonify({"success": True}), 200
 
 @app.route('/pump-status', methods=['GET'])
 def get_pump_status():
     """Endpoint untuk ESP32 biasa check status pam secara berkala"""
     if not sensor_history:
-        return jsonify({
-            "action_water": False,
-            "action_fertilize": False
-        }), 200
-    
-    # Ambil keputusan logik paling terkini dari database simulation
+        return jsonify({"action_water": False, "action_fertilize": False}), 200
     latest_record = sensor_history[-1]
     return jsonify({
         "action_water": latest_record.get("action_water", False),
@@ -89,124 +144,41 @@ def get_pump_status():
 
 @app.route('/detect', methods=['POST'])
 def detect_plant():
+    """Endpoint menerima gambar dari ESP32-CAM"""
     try:
         global latest_image, latest_image_base64, latest_image_timestamp
+        global latest_leaf_analysis, latest_diagnosis, latest_confidence, latest_has_disease
         
-        # Ambil data sensor dari HTTP Headers (ESP32-CAM)
-        soil_raw = request.headers.get('X-Soil-Raw', type=int, default=2500)
-        soil_percent = request.headers.get('X-Soil-Percent', type=float, default=50.0)
-        
-        logger.info(f"Data Masuk -> Tanah: {soil_percent}% ({soil_raw})")
-        
-        # Ambil imej binari dari request body
         image_data = request.data
         if not image_data:
             return jsonify({"error": "Tiada imej diterima"}), 400
         
-        # Simpan latest image untuk dashboard
         latest_image = image_data
         latest_image_base64 = base64.b64encode(image_data).decode('utf-8')
         latest_image_timestamp = datetime.now().isoformat()
         
-        # Decode imej format OpenCV
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
             return jsonify({"error": "Gagal decode imej"}), 400
         
-        # ========== STEP 1: ANALISIS WARNA DAUN (OPENCV) ==========
-        leaf_analysis = analyze_leaf_health(img)
+        # Analisis Imej & Simpan ke State Global
+        latest_leaf_analysis = analyze_leaf_health(img)
         
-        # ========== STEP 2: DETECT PENYAKIT (AI MODEL / FALLBACK) ==========
         if model_available:
             disease_result = detect_disease_with_model(img)
         else:
-            disease_result = detect_disease_simple(img, leaf_analysis)
+            disease_result = detect_disease_simple(img, latest_leaf_analysis)
         
-        diagnosis = disease_result['diagnosis']
-        disease_confidence = disease_result['confidence']
-        has_disease = disease_result['has_disease']
+        latest_diagnosis = disease_result['diagnosis']
+        latest_confidence = disease_result['confidence']
+        latest_has_disease = disease_result['has_disease']
         
-        # ========== STEP 3: LOGIK KEPUTUSAN PINTAR (KEMASKINI) ==========
-        action_water = False
-        action_fertilize = False
-        alert_disease = False
-        decision_reason = ""
+        # Selepas imej selesai diproses, kemaskini keputusan pintar
+        run_smart_logic()
         
-        soil_is_dry = soil_percent > MOISTURE_THRESHOLD_DRY
-        leaf_is_stressed = leaf_analysis['stress_level'] > 0.5
-        leaf_color_changed = leaf_analysis['color_abnormal']
-        
-        # Dapatkan hari semasa (0=Isnin, 1=Selasa, 2=Rabu, 3=Khamis, 4=Jumaat, 5=Sabtu, 6=Ahad)
-        hari_sekarang = datetime.now().weekday()
-        # Tetapkan hari baja: Isnin (0) dan Khamis (3) -> 2 kali seminggu
-        hari_baja = [0, 3] 
-        
-        # 1. KES UTAMA: Tanah Kering (Pokok perlukan air segera tak kira daun stress atau tidak)
-        if soil_is_dry:
-            # Kalau tanah kering pada HARI BAJA dan daun pula stress/sakit, bagi baja terus
-            if (hari_sekarang in hari_baja) and (leaf_is_stressed or diagnosis == "Chili Bell Bacterial Spot"):
-                action_fertilize = True
-                decision_reason = "Tanah Kering + Daun Stres/Sakit + [HARI BAJA] -> Pam Baja Hidup"
-            else:
-                # Hari biasa atau daun sihat, siram air biasa sahaja
-                action_water = True
-                decision_reason = "Tanah Kering -> Pam Air Hidup untuk selamatkan pokok"
-                
-        # 2. KES KEDUA: Tanah Masih Lembap tapi Daun Stres/Sakit
-        elif not soil_is_dry and (leaf_is_stressed or diagnosis == "Chili Bell Bacterial Spot"):
-            # Hanya beri baja kalau jatuh pada hari jadual baja seminggu 2 kali
-            if hari_sekarang in hari_baja:
-                action_fertilize = True
-                decision_reason = "Tanah OK + Daun Stres/Sakit + [HARI BAJA] -> Pam Baja Hidup"
-            else:
-                # Kalau bukan hari baja, jangan siram apa-apa untuk elak over-watering / over-fertilizing
-                decision_reason = "Tanah OK + Daun Stres/Sakit TAPI [BUKAN HARI BAJA] -> Pam Ditahan"
-        
-        # 3. KES KETIGA: Amaran Penyakit (OpenCV / AI Model)
-        if leaf_color_changed or has_disease or diagnosis == "Chili Bell Bacterial Spot":
-            alert_disease = True
-            decision_reason += f" | AMARAN PENYAKIT: {diagnosis}"
-        
-        # 4. KES KEEMPAT: Semua Sentiasa Sihat
-        if not action_water and not action_fertilize and not alert_disease:
-            decision_reason = "Semua parameter normal - Pokok Cili Sihat!"
-        
-        # Simpan rekod dalam memori
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "soil_percent": soil_percent,
-            "soil_raw": soil_raw,
-            "diagnosis": diagnosis,
-            "disease_confidence": disease_confidence,
-            "leaf_stress": leaf_analysis['stress_level'],
-            "leaf_color_normal": not leaf_analysis['color_abnormal'],
-            "action_water": action_water,
-            "action_fertilize": action_fertilize,
-            "alert_disease": alert_disease
-        }
-        sensor_history.append(record)
-        if len(sensor_history) > max_history:
-            sensor_history.pop(0)
-            
-        return jsonify({
-            "success": True,
-            "timestamp": datetime.now().isoformat(),
-            "sensor": {
-                "soil_raw": soil_raw,
-                "soil_percent": soil_percent,
-                "soil_status": "DRY" if soil_is_dry else "MOIST"
-            },
-            "leaf_analysis": leaf_analysis,
-            "diagnosis": diagnosis,
-            "confidence": disease_confidence,
-            "has_disease": has_disease,
-            "action_water": action_water,
-            "action_fertilize": action_fertilize,
-            "alert_disease": alert_disease,
-            "decision_reason": decision_reason
-        }), 200
+        return jsonify({"success": True, "message": "Image analyzed successfully"}), 200
         
     except Exception as e:
         logger.error(f"Error dalam fungsi detect_plant: {str(e)}")
@@ -214,58 +186,36 @@ def detect_plant():
 
 @app.route('/latest-image', methods=['GET'])
 def get_latest_image():
-    """Serve latest image captured by ESP32"""
     if latest_image is None:
         return jsonify({"error": "No image captured yet"}), 404
-    
-    try:
-        return send_file(
-            BytesIO(latest_image),
-            mimetype='image/jpeg',
-            as_attachment=False
-        )
-    except Exception as e:
-        logger.error(f"Error serving image: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+    return send_file(BytesIO(latest_image), mimetype='image/jpeg')
 
 @app.route('/latest-image-data', methods=['GET'])
 def get_latest_image_data():
-    """Serve latest image as base64 JSON (for dashboard display)"""
     if latest_image_base64 is None:
         return jsonify({"error": "No image captured yet"}), 404
-    
-    return jsonify({
-        "image_base64": latest_image_base64,
-        "timestamp": latest_image_timestamp,
-        "status": "OK"
-    }), 200
+    return jsonify({"image_base64": latest_image_base64, "timestamp": latest_image_timestamp, "status": "OK"})
 
 @app.route('/history', methods=['GET'])
 def get_history():
-    return jsonify({
-        "count": len(sensor_history),
-        "data": sensor_history[-20:]
-    }), 200
+    return jsonify({"count": len(sensor_history), "data": sensor_history[-20:]})
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
     if not sensor_history:
         return jsonify({"message": "No data yet"}), 200
-    
     avg_soil = np.mean([r['soil_percent'] for r in sensor_history])
     avg_stress = np.mean([r['leaf_stress'] for r in sensor_history])
     disease_count = sum(1 for r in sensor_history if r['alert_disease'])
-    
     return jsonify({
         "total_checks": len(sensor_history),
         "avg_soil_moisture": float(avg_soil),
         "avg_leaf_stress": float(avg_stress),
         "disease_alerts_count": disease_count,
         "last_check": sensor_history[-1]['timestamp']
-    }), 200
+    })
 
-# ========== FUNCTIONS ==========
-
+# ========== OPENCV & AI FUNCTIONS ==========
 def analyze_leaf_health(img):
     img_small = cv2.resize(img, (200, 200))
     hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
@@ -299,28 +249,20 @@ def detect_disease_with_model(img):
         img_resized = cv2.resize(img, (224, 224))
         img_normalized = img_resized.astype('float32') / 255.0
         img_batch = np.expand_dims(img_normalized, axis=0)
-        
         predictions = model.predict(img_batch, verbose=0)
         class_idx = np.argmax(predictions[0])
-        confidence = float(predictions[0][class_idx])
-        
-        diagnosis = CLASS_NAMES[class_idx] if class_idx < len(CLASS_NAMES) else "Unknown"
-        has_disease = class_idx == 0  # 0 = Bacterial Spot (Sakit), 1 = Healthy
-        
-        return {"diagnosis": diagnosis, "confidence": confidence, "has_disease": has_disease}
+        return {"diagnosis": CLASS_NAMES[class_idx], "confidence": float(predictions[0][class_idx]), "has_disease": class_idx == 0}
     except:
         return {"diagnosis": "Model Error", "confidence": 0.0, "has_disease": False}
 
 def detect_disease_simple(img, leaf_analysis):
     green_ratio = leaf_analysis['green_ratio']
     stress_level = leaf_analysis['stress_level']
-    
     if stress_level > 0.6 and green_ratio < 0.25:
         return {"diagnosis": "Chili Bell Bacterial Spot (Estimated)", "confidence": 0.75, "has_disease": True}
     elif stress_level > 0.4 and green_ratio < 0.4:
         return {"diagnosis": "Leaf Stress / Nutrient Deficiency", "confidence": 0.60, "has_disease": True}
-    else:
-        return {"diagnosis": "Chili Bell Healthy", "confidence": 0.90, "has_disease": False}
+    return {"diagnosis": "Chili Bell Healthy", "confidence": 0.90, "has_disease": False}
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

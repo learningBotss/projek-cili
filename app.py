@@ -1,6 +1,7 @@
 """
 CHILI STRESS DETECTION BACKEND - PYTHON FLASK
 UiTM ITT569 IoT Final Project - CDCS259
+*Edisi Pembetulan Logik Amaran Tanah Kering*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -49,8 +50,8 @@ except Exception as e:
     model_available = False
 
 # ========== SENSOR THRESHOLDS ==========
-# Mengikut tetapan map ESP32: Raw tinggi (4095) = Kering (100%)
-MOISTURE_THRESHOLD_DRY = 70.0  
+# PEMBETULAN: Mengikut tetapan map baru ESP32: Peratusan rendah (< 30%) bermaksud tanah kering
+MOISTURE_THRESHOLD_DRY = 30.0  
 
 # ========== DATA STORAGE ==========
 latest_image_base64 = None  
@@ -113,13 +114,14 @@ def detect_plant():
         disease_confidence = disease_result['confidence']
         has_disease = disease_result['has_disease']
         
-        # ========== STEP 3: LOGIK KEPUTUSAN PINTAR (BETULKAN KONFLIK) ==========
+        # ========== STEP 3: LOGIK KEPUTUSAN PINTAR ==========
         action_water = False
         action_fertilize = False
         alert_disease = False
         decision_reason = ""
         
-        soil_is_dry = soil_percent > MOISTURE_THRESHOLD_DRY
+        # PEMBETULAN: soil_percent di bawah threshold baru dikira kering lencun
+        soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
         leaf_is_stressed = leaf_analysis['stress_level'] > 0.5
         
         # Hanya jalankan logik jika tumbuhan sahih dikesan
@@ -197,8 +199,8 @@ def receive_soil_data():
         last_confidence = sensor_history[-1]['disease_confidence'] if sensor_history else 0.0
         last_stress = sensor_history[-1]['leaf_stress'] if sensor_history else 0.0
         
-        # Update logik keputusan berdasarkan data tanah baru
-        soil_is_dry = soil_percent > MOISTURE_THRESHOLD_DRY
+        # PEMBETULAN LOGIK: soil_percent di bawah threshold baru dikira kering lencun
+        soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
         
         if last_diagnosis == "Chili Bell Healthy":
             if soil_is_dry:

@@ -265,39 +265,12 @@
             transform: scale(1.02);
         }
 
-        .btn-success {
-            background: #28a745;
-            color: white;
-        }
-
-        .btn-success:hover {
-            background: #218838;
-        }
-
-        .btn-danger {
-            background: #dc3545;
-            color: white;
-        }
-
-        .btn-danger:hover {
-            background: #c82333;
-        }
-
-        .btn-warning {
-            background: #ffc107;
-            color: black;
-        }
-
-        .btn-warning:hover {
-            background: #e0a800;
-        }
-
         .btn:disabled {
             opacity: 0.6;
             cursor: not-allowed;
         }
 
-        /* Chart Container */
+        /* Chart/Full Width Layout */
         .full-width {
             grid-column: 1 / -1;
         }
@@ -389,7 +362,6 @@
             <p>Real-time plant health monitoring and automated care</p>
         </div>
 
-        <!-- CAMERA FEED SECTION -->
         <div class="camera-section">
             <div class="card-title">📹 Live Camera Feed</div>
             <div class="camera-container">
@@ -411,9 +383,7 @@
             </div>
         </div>
 
-        <!-- MAIN DASHBOARD CARDS -->
         <div class="dashboard">
-            <!-- Soil Moisture Card -->
             <div class="card">
                 <div class="card-icon">💧</div>
                 <div class="card-title">Soil Moisture</div>
@@ -425,7 +395,6 @@
                 <div class="sensor-label" id="soilLabel">-</div>
             </div>
 
-            <!-- Leaf Health Card -->
             <div class="card">
                 <div class="card-icon">🍃</div>
                 <div class="card-title">Leaf Health Score</div>
@@ -436,7 +405,6 @@
                 <div class="sensor-label">Green color detection</div>
             </div>
 
-            <!-- Disease Detection Card -->
             <div class="card">
                 <div class="card-icon">🔬</div>
                 <div class="card-title">Disease Detection</div>
@@ -445,7 +413,6 @@
                 <div id="diseaseStatus" style="margin-top: 15px;"></div>
             </div>
 
-            <!-- Last Check Card -->
             <div class="card">
                 <div class="card-icon">⏰</div>
                 <div class="card-title">Last Check</div>
@@ -453,26 +420,22 @@
                 <div class="sensor-label">System monitoring active</div>
             </div>
 
-            <!-- System Status Card -->
             <div class="card full-width">
                 <div class="card-icon">⚙️</div>
-                <div class="card-title">System Status</div>
+                <div class="card-title">System Status & Logic Decision</div>
                 <div id="systemStatus">-</div>
             </div>
 
-            <!-- Statistics Card -->
             <div class="card">
                 <div class="card-icon">📊</div>
                 <div class="card-title">Statistics</div>
                 <div id="stats"></div>
             </div>
 
-            <!-- Alert Box -->
             <div class="card full-width" id="alertContainer" style="display: none;">
                 <div id="alertContent"></div>
             </div>
 
-            <!-- History Table -->
             <div class="card full-width">
                 <div class="card-title">Recent Activity</div>
                 <table class="history-table">
@@ -494,20 +457,19 @@
         </div>
 
         <div class="footer">
-            <p>Chili Stress Detection System v1.1 | UiTM Faculty of Computer and Mathematical Sciences | Now with Live Camera Feed!</p>
+            <p>Chili Stress Detection System v1.2 | UiTM Faculty of Computer and Mathematical Sciences | CDCS259 IoT Project</p>
         </div>
     </div>
 
     <script>
         // ========== CONFIGURATION ==========
-        const BACKEND_URL = "https://projek-cili.onrender.com"; // Change for local testing
-        const DETECT_URL = BACKEND_URL + "/detect";
+        const BACKEND_URL = window.location.origin; // Auto-detect URL or change to "https://projek-cili.onrender.com"
         const HISTORY_URL = BACKEND_URL + "/history";
         const STATS_URL = BACKEND_URL + "/stats";
         const IMAGE_URL = BACKEND_URL + "/latest-image-data";
 
         // ========== AUTO-REFRESH INTERVAL ==========
-        let autoRefreshInterval = 30 * 60 * 1000; // 30 minutes
+        let autoRefreshInterval = 30 * 1000; // 30 seconds
         let lastCheckTime = null;
 
         // ========== FETCH DATA ==========
@@ -609,23 +571,23 @@
         // ========== UPDATE DASHBOARD ==========
         function updateDashboard(data) {
             if (!data.data || data.data.length === 0) {
-                showAlert("info", "No data yet. Waiting for first ESP32 detection...");
+                showAlert("info", "No data yet. Waiting for peranti ESP32 to upload data...");
                 return;
             }
 
             const latest = data.data[data.data.length - 1];
 
-            // Update Soil Moisture
+            // Update Soil Moisture (Logik standard: Bawah 30% dikira kering)
             const soilPercent = Math.round(latest.soil_percent);
             document.getElementById('soilPercent').textContent = soilPercent + '%';
             document.getElementById('soilProgressBar').style.width = soilPercent + '%';
             
             const soilStatus = document.getElementById('soilStatus');
-            if (soilPercent > 70) {
+            if (soilPercent < 30) {
                 soilStatus.textContent = 'DRY ⚠️';
                 soilStatus.className = 'status-badge status-danger';
                 document.getElementById('soilLabel').textContent = 'Soil is very dry - needs water!';
-            } else if (soilPercent > 40) {
+            } else if (soilPercent <= 70) {
                 soilStatus.textContent = 'NORMAL ✓';
                 soilStatus.className = 'status-badge status-good';
                 document.getElementById('soilLabel').textContent = 'Soil moisture is optimal';
@@ -657,7 +619,7 @@
             document.getElementById('lastCheck').textContent = checkTime.toLocaleTimeString();
             lastCheckTime = checkTime;
 
-            // Update System Status
+            // Update System Status & Decision Reasoning
             let statusHTML = '<div>';
             if (latest.action_water) {
                 statusHTML += '<div class="alert-box alert-warning">💧 Water pump was activated</div>';
@@ -671,6 +633,12 @@
             if (!latest.action_water && !latest.action_fertilize && !latest.alert_disease) {
                 statusHTML += '<div class="alert-box alert-success">✓ All systems normal</div>';
             }
+
+            // PAPARAN LOGIK BARU: Menunjukkan justifikasi keputusan Python backend
+            if (latest.decision_reason) {
+                statusHTML += `<div style="margin-top: 15px; font-size: 0.95em; color: #333; padding: 10px; background: #f1f3f5; border-radius: 6px;"><strong>AI Decision Logic:</strong> <span style="color:#764ba2; font-weight:600;">${latest.decision_reason}</span></div>`;
+            }
+
             statusHTML += '</div>';
             document.getElementById('systemStatus').innerHTML = statusHTML;
 
@@ -704,7 +672,7 @@
                 return;
             }
 
-            // Show last 10 records
+            // Tunjuk 10 rekod terakhir secara menurun (terbaru atas sekali)
             records.slice(-10).reverse().forEach(record => {
                 const time = new Date(record.timestamp);
                 const actions = [];
@@ -724,25 +692,11 @@
             });
         }
 
-        // ========== USER ACTIONS ==========
-        async function manualCheck() {
-            const btn = event.target;
-            btn.disabled = true;
-            btn.textContent = 'Checking...';
-
-            await fetchData();
-            await fetchStats();
-            await fetchCameraImage();
-
-            btn.disabled = false;
-            btn.textContent = 'Manual Check Now';
-        }
-
         function showAlert(type, message) {
             const container = document.getElementById('alertContainer');
             const content = document.getElementById('alertContent');
             
-            const alertClass = `alert-${type}`;
+            const alertClass = `alert-${type}`
             content.innerHTML = `<div class="alert-box ${alertClass}">${message}</div>`;
             container.style.display = 'block';
 
@@ -757,15 +711,15 @@
             fetchStats();
             fetchCameraImage();
 
-            // Auto-refresh every 30 seconds
+            // Auto-refresh data secara berkala setiap 30 saat
             setInterval(() => {
                 fetchData();
                 fetchStats();
                 fetchCameraImage();
-            }, 30000);
+            }, autoRefreshInterval);
 
-            console.log("Dashboard initialized with camera feed");
-            showAlert("info", "✓ Dashboard ready. Waiting for ESP32 data...");
+            console.log("Dashboard initialized with split data system setup.");
+            showAlert("info", "✓ Dashboard ready. Listening to ESP32-CAM and ESP32 Node data.");
         }
 
         // Start when page loads

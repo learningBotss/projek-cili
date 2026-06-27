@@ -71,6 +71,22 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }), 200
 
+@app.route('/pump-status', methods=['GET'])
+def get_pump_status():
+    """Endpoint untuk ESP32 biasa check status pam secara berkala"""
+    if not sensor_history:
+        return jsonify({
+            "action_water": False,
+            "action_fertilize": False
+        }), 200
+    
+    # Ambil keputusan logik paling terkini dari database simulation
+    latest_record = sensor_history[-1]
+    return jsonify({
+        "action_water": latest_record.get("action_water", False),
+        "action_fertilize": latest_record.get("action_fertilize", False)
+    }), 200
+
 @app.route('/detect', methods=['POST'])
 def detect_plant():
     try:
@@ -112,7 +128,7 @@ def detect_plant():
         disease_confidence = disease_result['confidence']
         has_disease = disease_result['has_disease']
         
-        # ========== STEP 3: LOGIK KEPUTUSAN PINNTAR ==========
+        # ========== STEP 3: LOGIK KEPUTUSAN PINTAR (KEMASKINI) ==========
         action_water = False
         action_fertilize = False
         alert_disease = False
@@ -122,19 +138,38 @@ def detect_plant():
         leaf_is_stressed = leaf_analysis['stress_level'] > 0.5
         leaf_color_changed = leaf_analysis['color_abnormal']
         
-        # Matriks keputusan:
-        if soil_is_dry and not leaf_is_stressed:
-            action_water = True
-            decision_reason = "Tanah Kering + Daun Normal -> Pam Air Hidup"
-            
+        # Dapatkan hari semasa (0=Isnin, 1=Selasa, 2=Rabu, 3=Khamis, 4=Jumaat, 5=Sabtu, 6=Ahad)
+        hari_sekarang = datetime.now().weekday()
+        # Tetapkan hari baja: Isnin (0) dan Khamis (3) -> 2 kali seminggu
+        hari_baja = [0, 3] 
+        
+        # 1. KES UTAMA: Tanah Kering (Pokok perlukan air segera tak kira daun stress atau tidak)
+        if soil_is_dry:
+            # Kalau tanah kering pada HARI BAJA dan daun pula stress/sakit, bagi baja terus
+            if (hari_sekarang in hari_baja) and (leaf_is_stressed or diagnosis == "Chili Bell Bacterial Spot"):
+                action_fertilize = True
+                decision_reason = "Tanah Kering + Daun Stres/Sakit + [HARI BAJA] -> Pam Baja Hidup"
+            else:
+                # Hari biasa atau daun sihat, siram air biasa sahaja
+                action_water = True
+                decision_reason = "Tanah Kering -> Pam Air Hidup untuk selamatkan pokok"
+                
+        # 2. KES KEDUA: Tanah Masih Lembap tapi Daun Stres/Sakit
         elif not soil_is_dry and (leaf_is_stressed or diagnosis == "Chili Bell Bacterial Spot"):
-            action_fertilize = True
-            decision_reason = "Tanah OK + Daun Sakit/Stres -> Pam Baja Hidup"
-            
+            # Hanya beri baja kalau jatuh pada hari jadual baja seminggu 2 kali
+            if hari_sekarang in hari_baja:
+                action_fertilize = True
+                decision_reason = "Tanah OK + Daun Stres/Sakit + [HARI BAJA] -> Pam Baja Hidup"
+            else:
+                # Kalau bukan hari baja, jangan siram apa-apa untuk elak over-watering / over-fertilizing
+                decision_reason = "Tanah OK + Daun Stres/Sakit TAPI [BUKAN HARI BAJA] -> Pam Ditahan"
+        
+        # 3. KES KETIGA: Amaran Penyakit (OpenCV / AI Model)
         if leaf_color_changed or has_disease or diagnosis == "Chili Bell Bacterial Spot":
             alert_disease = True
             decision_reason += f" | AMARAN PENYAKIT: {diagnosis}"
         
+        # 4. KES KEEMPAT: Semua Sentiasa Sihat
         if not action_water and not action_fertilize and not alert_disease:
             decision_reason = "Semua parameter normal - Pokok Cili Sihat!"
         

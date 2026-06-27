@@ -39,6 +39,116 @@
             opacity: 0.9;
         }
 
+        /* ========== CAMERA FEED SECTION ========== */
+        .camera-section {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            margin-bottom: 30px;
+        }
+
+        .camera-container {
+            position: relative;
+            width: 100%;
+            background: #f0f0f0;
+            border-radius: 8px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 300px;
+        }
+
+        .camera-feed {
+            max-width: 100%;
+            max-height: 500px;
+            width: auto;
+            height: auto;
+        }
+
+        .camera-placeholder {
+            color: #999;
+            font-size: 1.2em;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .camera-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 15px;
+            font-size: 0.95em;
+            color: #666;
+        }
+
+        .camera-timestamp {
+            font-weight: 600;
+            color: #333;
+        }
+
+        .camera-status {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+
+        .status-live {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-waiting {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .status-error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        /* ========== REFRESH BUTTON ========== */
+        .camera-controls {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .btn-refresh {
+            padding: 10px 20px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-refresh:hover {
+            background: #5568d3;
+            transform: scale(1.02);
+        }
+
+        .btn-refresh:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .btn-refresh.loading {
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* ========== MAIN DASHBOARD GRID ========== */
         .dashboard {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -248,29 +358,12 @@
             color: #0c5460;
         }
 
-        /* Footer */
         .footer {
             text-align: center;
             color: white;
-            margin-top: 40px;
-            padding: 20px;
+            margin-top: 50px;
             opacity: 0.8;
-        }
-
-        /* Loading spinner */
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #667eea;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+            font-size: 0.95em;
         }
 
         /* Responsive */
@@ -279,12 +372,12 @@
                 font-size: 1.8em;
             }
 
-            .sensor-value {
-                font-size: 2em;
-            }
-
             .dashboard {
                 grid-template-columns: 1fr;
+            }
+
+            .button-group {
+                flex-direction: column;
             }
         }
     </style>
@@ -293,66 +386,81 @@
     <div class="container">
         <div class="header">
             <h1>🌶️ Chili Stress Detection System</h1>
-            <p>Real-time monitoring and automated plant care</p>
+            <p>Real-time plant health monitoring and automated care</p>
         </div>
 
+        <!-- CAMERA FEED SECTION -->
+        <div class="camera-section">
+            <div class="card-title">📹 Live Camera Feed</div>
+            <div class="camera-container">
+                <div id="cameraContent" class="camera-placeholder">
+                    ⏳ Waiting for first image from ESP32...
+                </div>
+            </div>
+            <div class="camera-info">
+                <span class="camera-timestamp">Last capture: <span id="cameraTime">-</span></span>
+                <span id="cameraStatusBadge" class="camera-status status-waiting">Waiting</span>
+            </div>
+            <div class="camera-controls">
+                <button class="btn-refresh" onclick="refreshCameraFeed()" id="refreshBtn">
+                    🔄 Refresh Now
+                </button>
+                <button class="btn btn-primary" onclick="downloadImage()" id="downloadBtn" disabled>
+                    💾 Download Image
+                </button>
+            </div>
+        </div>
+
+        <!-- MAIN DASHBOARD CARDS -->
         <div class="dashboard">
             <!-- Soil Moisture Card -->
             <div class="card">
                 <div class="card-icon">💧</div>
                 <div class="card-title">Soil Moisture</div>
-                <div class="sensor-value" id="soilPercent">--</div>
-                <div class="sensor-label">Moisture Level (%)</div>
+                <div class="sensor-value" id="soilPercent">-</div>
                 <div class="progress-bar">
-                    <div class="progress-fill" id="soilProgressBar" style="width: 50%"></div>
+                    <div class="progress-fill" id="soilProgressBar" style="width: 0%"></div>
                 </div>
-                <div class="status-badge" id="soilStatus">LOADING</div>
+                <span id="soilStatus" class="status-badge status-warning">Loading...</span>
+                <div class="sensor-label" id="soilLabel">-</div>
             </div>
 
             <!-- Leaf Health Card -->
             <div class="card">
                 <div class="card-icon">🍃</div>
-                <div class="card-title">Leaf Health</div>
-                <div class="sensor-value" id="leafHealth">--</div>
-                <div class="sensor-label">Health Score (%)</div>
+                <div class="card-title">Leaf Health Score</div>
+                <div class="sensor-value" id="leafHealth">-</div>
                 <div class="progress-bar">
-                    <div class="progress-fill" id="leafProgressBar" style="width: 50%"></div>
+                    <div class="progress-fill" id="leafProgressBar" style="width: 0%; background: linear-gradient(90deg, #28a745, #20c997);"></div>
                 </div>
-                <div id="leafAnalysis"></div>
+                <div class="sensor-label">Green color detection</div>
             </div>
 
             <!-- Disease Detection Card -->
             <div class="card">
-                <div class="card-icon">🔍</div>
+                <div class="card-icon">🔬</div>
                 <div class="card-title">Disease Detection</div>
-                <div id="diagnosis" style="font-size: 1.3em; color: #333; margin: 15px 0; font-weight: 600;">--</div>
-                <div id="confidence" style="color: #666; margin-bottom: 10px;">Confidence: --</div>
-                <div id="diseaseStatus"></div>
+                <div id="diagnosis" style="font-size: 1.2em; font-weight: 600; color: #333; margin: 15px 0;">-</div>
+                <div id="confidence" style="color: #666; font-size: 0.95em;">Confidence: -</div>
+                <div id="diseaseStatus" style="margin-top: 15px;"></div>
             </div>
 
             <!-- Last Check Card -->
             <div class="card">
                 <div class="card-icon">⏰</div>
                 <div class="card-title">Last Check</div>
-                <div id="lastCheck" style="font-size: 1.2em; color: #667eea; margin: 15px 0;">--</div>
-                <div id="autoCheckTime" style="color: #666; font-size: 0.95em;">Auto-check every 30 minutes</div>
-                <button class="btn btn-primary" onclick="manualCheck()" style="margin-top: 15px; width: 100%;">
-                    Manual Check Now
-                </button>
+                <div class="sensor-value" id="lastCheck" style="font-size: 1.8em;">-</div>
+                <div class="sensor-label">System monitoring active</div>
             </div>
 
             <!-- System Status Card -->
-            <div class="card">
+            <div class="card full-width">
                 <div class="card-icon">⚙️</div>
                 <div class="card-title">System Status</div>
-                <div id="systemStatus"></div>
-                <div class="button-group">
-                    <button class="btn btn-success" onclick="testWaterPump()" id="waterPumpBtn">Test Water</button>
-                    <button class="btn btn-warning" onclick="testFertilizerPump()" id="fertilizerPumpBtn">Test Fertilizer</button>
-                </div>
+                <div id="systemStatus">-</div>
             </div>
 
-            <!-- Decision History Card -->
+            <!-- Statistics Card -->
             <div class="card">
                 <div class="card-icon">📊</div>
                 <div class="card-title">Statistics</div>
@@ -386,15 +494,17 @@
         </div>
 
         <div class="footer">
-            <p>Chili Stress Detection System v1.0 | UiTM Faculty of Computer and Mathematical Sciences</p>
+            <p>Chili Stress Detection System v1.1 | UiTM Faculty of Computer and Mathematical Sciences | Now with Live Camera Feed!</p>
         </div>
     </div>
 
     <script>
         // ========== CONFIGURATION ==========
-        // CHANGE THIS TO YOUR BACKEND SERVER URL
-        const BACKEND_URL = "https://projek-cili.onrender.com/detect"; // Local testing
-        // For production: "https://your-app.render.com"
+        const BACKEND_URL = "https://projek-cili.onrender.com"; // Change for local testing
+        const DETECT_URL = BACKEND_URL + "/detect";
+        const HISTORY_URL = BACKEND_URL + "/history";
+        const STATS_URL = BACKEND_URL + "/stats";
+        const IMAGE_URL = BACKEND_URL + "/latest-image-data";
 
         // ========== AUTO-REFRESH INTERVAL ==========
         let autoRefreshInterval = 30 * 60 * 1000; // 30 minutes
@@ -403,7 +513,7 @@
         // ========== FETCH DATA ==========
         async function fetchData() {
             try {
-                const response = await fetch(`${BACKEND_URL}/history`);
+                const response = await fetch(`${HISTORY_URL}`);
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 
                 const data = await response.json();
@@ -416,7 +526,7 @@
 
         async function fetchStats() {
             try {
-                const response = await fetch(`${BACKEND_URL}/stats`);
+                const response = await fetch(`${STATS_URL}`);
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 
                 const stats = await response.json();
@@ -424,6 +534,76 @@
             } catch (error) {
                 console.error("Stats fetch error:", error);
             }
+        }
+
+        // ========== FETCH CAMERA IMAGE ==========
+        async function fetchCameraImage() {
+            try {
+                const response = await fetch(`${IMAGE_URL}`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                
+                const data = await response.json();
+                displayCameraImage(data);
+            } catch (error) {
+                console.error("Camera fetch error:", error);
+                updateCameraStatus('error', 'No image available');
+            }
+        }
+
+        // ========== DISPLAY CAMERA IMAGE ==========
+        function displayCameraImage(data) {
+            const container = document.getElementById('cameraContent');
+            const imageBase64 = data.image_base64;
+            const timestamp = new Date(data.timestamp);
+
+            // Create or update image element
+            let img = container.querySelector('img');
+            if (!img) {
+                img = document.createElement('img');
+                img.className = 'camera-feed';
+                container.innerHTML = '';
+                container.appendChild(img);
+            }
+
+            img.src = `data:image/jpeg;base64,${imageBase64}`;
+            
+            // Update timestamp
+            document.getElementById('cameraTime').textContent = timestamp.toLocaleTimeString();
+            document.getElementById('downloadBtn').disabled = false;
+
+            updateCameraStatus('live', 'Live');
+        }
+
+        // ========== UPDATE CAMERA STATUS ==========
+        function updateCameraStatus(status, label) {
+            const badge = document.getElementById('cameraStatusBadge');
+            badge.textContent = label;
+            badge.className = `camera-status status-${status}`;
+        }
+
+        // ========== REFRESH CAMERA FEED ==========
+        async function refreshCameraFeed() {
+            const btn = document.getElementById('refreshBtn');
+            btn.disabled = true;
+            btn.classList.add('loading');
+            btn.textContent = '🔄 Refreshing...';
+
+            await fetchCameraImage();
+
+            btn.disabled = false;
+            btn.classList.remove('loading');
+            btn.textContent = '🔄 Refresh Now';
+        }
+
+        // ========== DOWNLOAD IMAGE ==========
+        function downloadImage() {
+            const img = document.querySelector('.camera-feed');
+            if (!img) return;
+
+            const link = document.createElement('a');
+            link.href = img.src;
+            link.download = `chili-camera-${new Date().getTime()}.jpg`;
+            link.click();
         }
 
         // ========== UPDATE DASHBOARD ==========
@@ -442,14 +622,17 @@
             
             const soilStatus = document.getElementById('soilStatus');
             if (soilPercent > 70) {
-                soilStatus.textContent = 'DRY';
+                soilStatus.textContent = 'DRY ⚠️';
                 soilStatus.className = 'status-badge status-danger';
+                document.getElementById('soilLabel').textContent = 'Soil is very dry - needs water!';
             } else if (soilPercent > 40) {
-                soilStatus.textContent = 'NORMAL';
+                soilStatus.textContent = 'NORMAL ✓';
                 soilStatus.className = 'status-badge status-good';
+                document.getElementById('soilLabel').textContent = 'Soil moisture is optimal';
             } else {
-                soilStatus.textContent = 'WET';
+                soilStatus.textContent = 'WET 💧';
                 soilStatus.className = 'status-badge status-good';
+                document.getElementById('soilLabel').textContent = 'Soil has plenty of water';
             }
 
             // Update Leaf Health
@@ -516,6 +699,11 @@
             const tableBody = document.getElementById('historyTable');
             tableBody.innerHTML = '';
 
+            if (records.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">No data yet</td></tr>';
+                return;
+            }
+
             // Show last 10 records
             records.slice(-10).reverse().forEach(record => {
                 const time = new Date(record.timestamp);
@@ -541,23 +729,13 @@
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Checking...';
-            btn.innerHTML = '<span class="loading"></span> Checking...';
 
-            // Note: In real scenario, ESP32 would trigger this
-            // For now, we just refresh the dashboard
             await fetchData();
             await fetchStats();
+            await fetchCameraImage();
 
             btn.disabled = false;
             btn.textContent = 'Manual Check Now';
-        }
-
-        function testWaterPump() {
-            showAlert("info", "💧 Water pump test: Activate for 10 seconds (check your system)");
-        }
-
-        function testFertilizerPump() {
-            showAlert("info", "🌱 Fertilizer pump test: Activate for 5 seconds (check your system)");
         }
 
         function showAlert(type, message) {
@@ -568,7 +746,6 @@
             content.innerHTML = `<div class="alert-box ${alertClass}">${message}</div>`;
             container.style.display = 'block';
 
-            // Auto-hide after 10 seconds
             setTimeout(() => {
                 container.style.display = 'none';
             }, 10000);
@@ -578,14 +755,16 @@
         function init() {
             fetchData();
             fetchStats();
+            fetchCameraImage();
 
-            // Auto-refresh every 30 seconds (for dashboard display)
+            // Auto-refresh every 30 seconds
             setInterval(() => {
                 fetchData();
                 fetchStats();
+                fetchCameraImage();
             }, 30000);
 
-            console.log("Dashboard initialized");
+            console.log("Dashboard initialized with camera feed");
             showAlert("info", "✓ Dashboard ready. Waiting for ESP32 data...");
         }
 

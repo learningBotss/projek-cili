@@ -162,12 +162,22 @@ def detect_plant():
             "decision_reason": decision_reason
         }
         
+        # Tentukan keperluan pokok berdasarkan status pam yang aktif
+        if action_water and action_fertilize:
+            plant_needs = "Need Water & Fertilizer"
+        elif action_water:
+            plant_needs = "Need Water"
+        elif action_fertilize:
+            plant_needs = "Need Fertilizer"
+        else:
+            plant_needs = "Optimal (No Action)"
+
         # Simpan rekod dalam memori sejarah
         record = {
             "timestamp": latest_image_timestamp,
             "soil_percent": soil_percent,
             "soil_raw": soil_raw,
-            "diagnosis": diagnosis,
+            "diagnosis": plant_needs,  # <--- Kita hantar status keperluan pokok ke frontend
             "disease_confidence": disease_confidence,
             "leaf_stress": leaf_analysis['stress_level'],
             "leaf_color_normal": not leaf_analysis['color_abnormal'],

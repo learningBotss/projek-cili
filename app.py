@@ -3,7 +3,7 @@ CHILI STRESS DETECTION BACKEND - PYTHON FLASK
 UiTM ITT569 IoT Final Project - CDCS259
 """
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 from flask_cors import CORS
 import cv2
 import numpy as np
@@ -13,10 +13,9 @@ import json
 from datetime import datetime
 import os
 import logging
+import base64
 
 # ========== CONFIGURATION ==========
-def index():
-    return render_template('dashboard.html')
 app = Flask(__name__)
 CORS(app)
 
@@ -47,6 +46,11 @@ except Exception as e:
 # ========== SENSOR THRESHOLDS ==========
 MOISTURE_THRESHOLD_DRY = 70.0  # % - Atas nilai ni = tanah kering
 
+# ========== LATEST IMAGE STORAGE ==========
+latest_image = None  # Simpan image binari
+latest_image_base64 = None  # Simpan base64 untuk HTML display
+latest_image_timestamp = None
+
 # ========== DATABASE SIMULATION (In-memory) ==========
 sensor_history = []
 max_history = 100
@@ -70,6 +74,8 @@ def health_check():
 @app.route('/detect', methods=['POST'])
 def detect_plant():
     try:
+        global latest_image, latest_image_base64, latest_image_timestamp
+        
         # Ambil data sensor dari HTTP Headers (ESP32-CAM)
         soil_raw = request.headers.get('X-Soil-Raw', type=int, default=2500)
         soil_percent = request.headers.get('X-Soil-Percent', type=float, default=50.0)
@@ -80,6 +86,11 @@ def detect_plant():
         image_data = request.data
         if not image_data:
             return jsonify({"error": "Tiada imej diterima"}), 400
+        
+        # Simpan latest image untuk dashboard
+        latest_image = image_data
+        latest_image_base64 = base64.b64encode(image_data).decode('utf-8')
+        latest_image_timestamp = datetime.now().isoformat()
         
         # Decode imej format OpenCV
         nparr = np.frombuffer(image_data, np.uint8)
@@ -165,6 +176,34 @@ def detect_plant():
     except Exception as e:
         logger.error(f"Error dalam fungsi detect_plant: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+@app.route('/latest-image', methods=['GET'])
+def get_latest_image():
+    """Serve latest image captured by ESP32"""
+    if latest_image is None:
+        return jsonify({"error": "No image captured yet"}), 404
+    
+    try:
+        return send_file(
+            BytesIO(latest_image),
+            mimetype='image/jpeg',
+            as_attachment=False
+        )
+    except Exception as e:
+        logger.error(f"Error serving image: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/latest-image-data', methods=['GET'])
+def get_latest_image_data():
+    """Serve latest image as base64 JSON (for dashboard display)"""
+    if latest_image_base64 is None:
+        return jsonify({"error": "No image captured yet"}), 404
+    
+    return jsonify({
+        "image_base64": latest_image_base64,
+        "timestamp": latest_image_timestamp,
+        "status": "OK"
+    }), 200
 
 @app.route('/history', methods=['GET'])
 def get_history():

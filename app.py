@@ -231,7 +231,7 @@ max_history = 100
 # (leaf detection, disease model, fertilizer decision) only runs once every
 # ANALYZE_EVERY_N_FRAMES frames. Between analysis frames we reuse the last
 # known result so decisions don't just disappear.
-ANALYZE_EVERY_N_FRAMES = 6  # e.g. ESP32 sends every 1s -> full analysis runs every ~3s
+ANALYZE_EVERY_N_FRAMES = 3  # e.g. ESP32 sends every 1s -> full analysis runs every ~3s
 
 frame_counter = 0
 last_leaf_analysis = None

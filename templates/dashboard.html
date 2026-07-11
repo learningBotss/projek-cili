@@ -154,7 +154,31 @@
         .reticle-corner.tr { top: 14px; right: 14px; border-left: none; border-bottom: none; border-radius: 0 6px 0 0; }
         .reticle-corner.bl { bottom: 14px; left: 14px; border-right: none; border-top: none; border-radius: 0 0 0 6px; }
         .reticle-corner.br { bottom: 14px; right: 14px; border-left: none; border-top: none; border-radius: 0 0 6px 0; }
-        .camera-feed { width: 100%; max-height: 580px; object-fit: contain; }
+        .camera-feed-wrap {
+            position: relative;
+            width: 100%;
+            max-height: 580px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .camera-feed {
+            width: 100%;
+            max-height: 580px;
+            object-fit: contain;
+        }
+        /* Cross-fade: two stacked images, only one visible at a time.
+           When a new frame arrives it fades IN on top of the old one
+           instead of the browser hard-swapping src (which causes a
+           visible flicker/pop). Feels noticeably smoother even though
+           the underlying frame rate hasn't changed. */
+        .camera-feed.layer-a, .camera-feed.layer-b {
+            position: absolute;
+            top: 0; left: 0;
+            opacity: 0;
+            transition: opacity 0.25s ease;
+        }
+        .camera-feed.visible { opacity: 1; z-index: 2; }
         .camera-placeholder {
             color: var(--ink-faint);
             font-size: 0.95em;
@@ -532,7 +556,13 @@
         const PUMP_STATUS_URL = BACKEND_URL + "/pump-status";
         const RESET_URL = BACKEND_URL + "/debug/reset-trackers";
 
-        const VIDEO_STREAM_INTERVAL = 1000;
+        // Poll FASTER than the ESP32's actual send rate (~1s) so that
+        // whenever a new frame really does land on the server, it shows up
+        // on screen almost immediately instead of waiting for the next
+        // slow 1000ms tick. Polling more than the real frame rate just
+        // re-fetches the same image (cheap - it's a small JSON+base64 call)
+        // until a genuinely new timestamp arrives.
+        const VIDEO_STREAM_INTERVAL = 500;
         const FERT_RING_CIRCUMFERENCE = 264; // 2 * PI * 42, rounded
 
         // Must match the backend's MOISTURE_THRESHOLD_DRY in app.py
@@ -542,21 +572,49 @@
         // wire causes occasional spikes up to ~45% even while genuinely dry).
         const SOIL_SMOOTHING_WINDOW = 5;
 
+        // Tracks the timestamp of the last frame we actually rendered, so
+        // we skip re-rendering (and re-triggering the fade transition) on
+        // polls that returned the exact same image.
+        let lastRenderedTimestamp = null;
+        let activeLayer = 'a'; // which cross-fade <img> is currently on top
+
         async function fetchStreamFeed() {
             try {
                 const response = await fetch(IMAGE_URL);
                 if (!response.ok) throw new Error();
                 const data = await response.json();
 
-                const container = document.getElementById('cameraContent');
-                let img = container.querySelector('img');
-                if (!img) {
-                    img = document.createElement('img');
-                    img.className = 'camera-feed';
-                    container.innerHTML = '';
-                    container.appendChild(img);
+                // Skip if this is the same frame we already showed - avoids
+                // needless re-render/flash on polls that land between two
+                // real ESP32 uploads.
+                if (data.timestamp === lastRenderedTimestamp) {
+                    return;
                 }
-                img.src = `data:image/jpeg;base64,${data.image_base64}`;
+                lastRenderedTimestamp = data.timestamp;
+
+                const container = document.getElementById('cameraContent');
+                let wrap = container.querySelector('.camera-feed-wrap');
+                if (!wrap) {
+                    container.innerHTML = `
+                        <div class="camera-feed-wrap">
+                            <img class="camera-feed layer-a" id="feedA">
+                            <img class="camera-feed layer-b" id="feedB">
+                        </div>`;
+                    wrap = container.querySelector('.camera-feed-wrap');
+                }
+
+                const feedA = document.getElementById('feedA');
+                const feedB = document.getElementById('feedB');
+                const showing = activeLayer === 'a' ? feedB : feedA; // load into the HIDDEN one
+                const hiding = activeLayer === 'a' ? feedA : feedB;
+
+                showing.onload = () => {
+                    // New image finished decoding - fade it in, fade the old one out
+                    showing.classList.add('visible');
+                    hiding.classList.remove('visible');
+                    activeLayer = activeLayer === 'a' ? 'b' : 'a';
+                };
+                showing.src = `data:image/jpeg;base64,${data.image_base64}`;
 
                 const mytTime = new Date(data.timestamp).toLocaleTimeString('en-MY', {timeZone: 'Asia/Kuala_Lumpur'});
                 document.getElementById('cameraTime').textContent = mytTime;

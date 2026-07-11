@@ -90,12 +90,57 @@ def get_water_tracker_info():
     }
 
 def reset_water_tracker():
+    global watering_session_active
     water_tracker["date"] = None
     water_tracker["count"] = 0
     water_tracker["history_times"] = []
+    watering_session_active = False
+
+# True while a watering dose is actively "in progress" (soil still dry since
+# it was triggered). Prevents the daily count from incrementing again on the
+# very next poll (every 3s) before the soil has had time to actually absorb
+# water - which was cutting doses off almost instantly.
+watering_session_active = False
+
+def handle_water_logic(soil_percent):
+    """
+    SINGLE SOURCE OF TRUTH for water pump decisions - called by BOTH /detect
+    and /soil so the two ESP32 nodes never diverge or double-count doses.
+
+    A daily "dose" is counted ONCE, when watering starts. The pump then stays
+    ON continuously (without re-counting or re-blocking) for as long as the
+    soil reports dry, and only turns OFF once the soil actually becomes
+    moist - instead of counting a fresh dose on every 3-second poll before
+    the water has had a chance to soak in.
+    """
+    global watering_session_active
+    soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
+
+    if soil_is_dry:
+        if watering_session_active:
+            return True, "Still dry - continuing current watering session (pump stays ON)"
+        if can_water_now():
+            watering_session_active = True
+            record_water_given()
+            w_info = get_water_tracker_info()
+            return True, f"Dry soil -> Water pump ON (dose {w_info['count_today']}/{WATER_DAILY_LIMIT} today)"
+        else:
+            return False, f"Soil is dry BUT the {WATER_DAILY_LIMIT}x/day water limit has been reached. Wait until tomorrow."
+    else:
+        if watering_session_active:
+            watering_session_active = False
+            return False, "Soil now moist - watering session complete, pump OFF"
+        return False, "Soil is moist - watering not needed."
 
 # ========== FERTILIZER PUMP: 7-DAY COOLDOWN ==========
 FERTILIZE_COOLDOWN_DAYS = 7
+
+# How long the fertilizer relay should physically stay ON for one dose.
+# This is a TIMER, separate from the decision logic below, so the pump
+# doesn't get cut off almost instantly by the next /detect call (which can
+# arrive every ~3-5s from the ESP32-CAM) before it had time to actually
+# dispense anything.
+FERTILIZE_PUMP_DURATION_SECONDS = 10
 
 fertilize_tracker = {
     "last_given": None
@@ -106,6 +151,26 @@ fertilize_tracker = {
 # next scan (once soil is wet enough) can still act on it instead of losing
 # the window.
 pending_fertilize = False
+
+# Timestamp (Malaysia time) until which the fertilizer relay should stay ON.
+# None / in the past = pump should be OFF.
+fertilize_on_until = None
+
+def trigger_fertilize_pump():
+    """Start (or restart) the 10s ON window for the fertilizer relay."""
+    global fertilize_on_until
+    fertilize_on_until = get_malaysia_time() + timedelta(seconds=FERTILIZE_PUMP_DURATION_SECONDS)
+
+def fertilize_pump_is_on():
+    """The ACTUAL relay state the ESP32 actuator should follow - timer based,
+    not tied to whatever the latest /detect decision cycle computed."""
+    return fertilize_on_until is not None and get_malaysia_time() < fertilize_on_until
+
+def fertilize_pump_seconds_remaining():
+    if fertilize_on_until is None:
+        return 0.0
+    remaining = (fertilize_on_until - get_malaysia_time()).total_seconds()
+    return max(0.0, round(remaining, 1))
 
 def can_fertilize_now():
     if fertilize_tracker["last_given"] is None:
@@ -139,9 +204,10 @@ def get_fertilize_tracker_info():
     }
 
 def reset_fertilize_tracker():
-    global pending_fertilize
+    global pending_fertilize, fertilize_on_until
     fertilize_tracker["last_given"] = None
     pending_fertilize = False
+    fertilize_on_until = None
 
 # ========== DATA STORAGE ==========
 latest_image_base64 = None
@@ -217,17 +283,9 @@ def detect_plant():
         needs_fertilizer = leaf_is_stressed or has_disease
 
         # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
-        if soil_is_dry:
-            if can_water_now():
-                action_water = True
-                record_water_given()
-                w_info = get_water_tracker_info()
-                decision_reason = f"Dry soil -> Water pump ON (dose {w_info['count_today']}/{WATER_DAILY_LIMIT} today)"
-            else:
-                action_water = False
-                decision_reason = f"Soil is dry BUT the {WATER_DAILY_LIMIT}x/day water limit has been reached. Wait until tomorrow."
-        else:
-            decision_reason = "Soil is moist - watering not needed."
+        # Uses the SAME shared function as /soil, so a dose triggered by one
+        # node is recognised by the other and never double-counted.
+        action_water, decision_reason = handle_water_logic(soil_percent)
 
         # -------- FERTILIZER PUMP LOGIC (requires plant detection + 7-day cooldown) --------
         # This block is the ONLY place in the whole app that is allowed to set
@@ -244,7 +302,8 @@ def detect_plant():
                         action_fertilize = True
                         pending_fertilize = False
                         record_fertilize_given()
-                        decision_reason += " | Plant stressed/diseased -> Fertilizer pump ON (7-day cooldown starts now)"
+                        trigger_fertilize_pump()
+                        decision_reason += f" | Plant stressed/diseased -> Fertilizer pump ON for {FERTILIZE_PUMP_DURATION_SECONDS}s (7-day cooldown starts now)"
                     else:
                         f_info = get_fertilize_tracker_info()
                         decision_reason += f" | Plant stress/disease detected BUT fertilizer is still on cooldown, {f_info['days_remaining']} day(s) left before it can be given again"
@@ -255,7 +314,8 @@ def detect_plant():
                     action_fertilize = True
                     pending_fertilize = False
                     record_fertilize_given()
-                    decision_reason += " | Soil now wet enough -> firing previously queued fertilizer dose (7-day cooldown starts now)"
+                    trigger_fertilize_pump()
+                    decision_reason += f" | Soil now wet enough -> firing previously queued fertilizer dose for {FERTILIZE_PUMP_DURATION_SECONDS}s (7-day cooldown starts now)"
                 else:
                     f_info = get_fertilize_tracker_info()
                     decision_reason += f" | Queued fertilizer dose still on cooldown, {f_info['days_remaining']} day(s) left"
@@ -347,21 +407,12 @@ def receive_soil_data():
         last_confidence = sensor_history[-1]['disease_confidence'] if sensor_history else 0.0
         last_stress = sensor_history[-1]['leaf_stress'] if sensor_history else 0.0
 
-        soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
-
         # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
-        if soil_is_dry:
-            if can_water_now():
-                current_pump_status["action_water"] = True
-                record_water_given()
-                w_info = get_water_tracker_info()
-                current_pump_status["decision_reason"] = f"Soil data: Dry -> Water pump ON (dose {w_info['count_today']}/{WATER_DAILY_LIMIT} today)"
-            else:
-                current_pump_status["action_water"] = False
-                current_pump_status["decision_reason"] = f"Soil data: Dry BUT the {WATER_DAILY_LIMIT}x/day water limit has been reached. Wait until tomorrow."
-        else:
-            current_pump_status["action_water"] = False
-            current_pump_status["decision_reason"] = "Soil data: Moist - watering not needed."
+        # Uses the SAME shared function as /detect, so a dose triggered by
+        # one node is recognised by the other and never double-counted.
+        action_water, water_reason = handle_water_logic(soil_percent)
+        current_pump_status["action_water"] = action_water
+        current_pump_status["decision_reason"] = f"Soil data: {water_reason}"
 
         # action_fertilize and alert_disease are intentionally left untouched
         # here - they keep whatever /detect last decided.
@@ -414,10 +465,16 @@ def reset_trackers():
 
 @app.route('/pump-status', methods=['GET'])
 def get_pump_status():
-    """Endpoint read by the ESP32 Actuator Node for relay control + the Dashboard"""
+    """Endpoint read by the ESP32 Actuator Node for relay control + the Dashboard.
+    IMPORTANT: action_fertilize here is the TIMER-based live state (stays True
+    for FERTILIZE_PUMP_DURATION_SECONDS after triggering), NOT just whatever
+    the most recent /detect decision cycle happened to compute. This is what
+    stops the relay from flicking OFF again before it had time to dispense."""
     status = dict(current_pump_status)
+    status["action_fertilize"] = fertilize_pump_is_on()
     status["water_tracker"] = get_water_tracker_info()
     status["fertilize_tracker"] = get_fertilize_tracker_info()
+    status["fertilize_tracker"]["seconds_remaining"] = fertilize_pump_seconds_remaining()
     return jsonify(status), 200
 
 @app.route('/latest-image-data', methods=['GET'])

@@ -155,29 +155,25 @@
         .reticle-corner.bl { bottom: 14px; left: 14px; border-right: none; border-top: none; border-radius: 0 0 0 6px; }
         .reticle-corner.br { bottom: 14px; right: 14px; border-left: none; border-top: none; border-radius: 0 0 6px 0; }
         .camera-feed-wrap {
-            position: relative;
+            display: grid;
             width: 100%;
             max-height: 580px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
         }
         .camera-feed {
+            grid-area: 1 / 1;
             width: 100%;
             max-height: 580px;
             object-fit: contain;
-        }
-        /* Cross-fade: two stacked images, only one visible at a time.
-           When a new frame arrives it fades IN on top of the old one
-           instead of the browser hard-swapping src (which causes a
-           visible flicker/pop). Feels noticeably smoother even though
-           the underlying frame rate hasn't changed. */
-        .camera-feed.layer-a, .camera-feed.layer-b {
-            position: absolute;
-            top: 0; left: 0;
             opacity: 0;
             transition: opacity 0.25s ease;
         }
+        /* Cross-fade: two stacked images sharing the same grid cell, only
+           one visible at a time. When a new frame arrives it fades IN on
+           top of the old one instead of the browser hard-swapping src
+           (which causes a visible flicker/pop). Using CSS Grid stacking
+           instead of position:absolute means the wrapper's height is still
+           sized by its content, so the feed can never collapse to 0px and
+           render as a black box. */
         .camera-feed.visible { opacity: 1; z-index: 2; }
         .camera-placeholder {
             color: var(--ink-faint);
@@ -544,7 +540,7 @@
         </div>
 
         <div class="footer">
-            Chili Stress Detection System v1.7 — UiTM Faculty of Computer and Mathematical Sciences — CDCS259 Intelligent Systems Engineering
+            Chili Stress Detection System v1.8 — UiTM Faculty of Computer and Mathematical Sciences — CDCS259 Intelligent Systems Engineering
         </div>
     </div>
 
@@ -567,10 +563,13 @@
 
         // Must match the backend's MOISTURE_THRESHOLD_DRY in app.py
         const DRY_THRESHOLD = 30;
-        // How many of the most recent readings to look at when deciding
-        // whether the plant is "really" dry vs. just sensor jitter (loose
-        // wire causes occasional spikes up to ~45% even while genuinely dry).
-        const SOIL_SMOOTHING_WINDOW = 5;
+        // How many CONSECUTIVE readings on the same side (dry/wet) are needed
+        // before the dashboard trusts a state change. A single noisy spike
+        // (loose wire jitter, e.g. 0% -> 45% -> 0%) never has 3 in a row, so
+        // it gets ignored completely instead of flipping the display.
+        const REQUIRED_STREAK = 3;
+        // How many recent readings to scan when working out the streak.
+        const SOIL_HISTORY_WINDOW = 10;
 
         // Tracks the timestamp of the last frame we actually rendered, so
         // we skip re-rendering (and re-triggering the fade transition) on
@@ -597,8 +596,8 @@
                 if (!wrap) {
                     container.innerHTML = `
                         <div class="camera-feed-wrap">
-                            <img class="camera-feed layer-a" id="feedA">
-                            <img class="camera-feed layer-b" id="feedB">
+                            <img class="camera-feed" id="feedA">
+                            <img class="camera-feed" id="feedB">
                         </div>`;
                     wrap = container.querySelector('.camera-feed-wrap');
                 }
@@ -645,30 +644,42 @@
             }
         }
 
-        // Vote-based smoothing: looks at the last few readings and only
-        // trusts a "wet" reading if the MAJORITY of them agree. A single
-        // noisy spike (e.g. 0% -> 45% -> 0% from a loose sensor wire) gets
-        // ignored instead of making the dashboard number flicker.
-        function getSmoothedSoilPercent(records) {
-            const sample = records.slice(-SOIL_SMOOTHING_WINDOW);
+        // Hysteresis/debounce smoothing: walks through the recent readings
+        // in order and only flips the "confirmed dry/wet" state once it
+        // sees REQUIRED_STREAK consecutive readings agreeing on a side.
+        // This is recomputed fresh from the growing history array each
+        // call, so it's deterministic and never gets out of sync - but it
+        // behaves like a Schmitt trigger: a lone spike can't move it.
+        function getDebouncedSoilPercent(records) {
+            const sample = records.slice(-SOIL_HISTORY_WINDOW);
             if (sample.length === 0) return 0;
 
-            const latestRaw = sample[sample.length - 1].soil_percent;
-            const dryVotes = sample.filter(r => r.soil_percent < DRY_THRESHOLD).length;
-            const majorityDry = dryVotes > sample.length / 2;
+            let confirmedDry = true; // assume dry until proven otherwise
+            let lastSide = null;
+            let streak = 0;
 
-            if (majorityDry) {
-                // Pin the display to 0 instead of showing a jittery spike.
-                return 0;
-            }
-            return Math.round(latestRaw);
+            sample.forEach(r => {
+                const side = r.soil_percent < DRY_THRESHOLD ? 'dry' : 'wet';
+                if (side === lastSide) {
+                    streak += 1;
+                } else {
+                    lastSide = side;
+                    streak = 1;
+                }
+                if (streak >= REQUIRED_STREAK) {
+                    confirmedDry = (side === 'dry');
+                }
+            });
+
+            const latestRaw = sample[sample.length - 1].soil_percent;
+            return confirmedDry ? 0 : Math.round(latestRaw);
         }
 
         function updateDashboard(data) {
             if (!data.data || data.data.length === 0) return;
             const latest = data.data[data.data.length - 1];
 
-            const soilPercent = getSmoothedSoilPercent(data.data);
+            const soilPercent = getDebouncedSoilPercent(data.data);
             document.getElementById('soilPercent').textContent = soilPercent + '%';
             document.getElementById('soilProgressBar').style.width = soilPercent + '%';
 

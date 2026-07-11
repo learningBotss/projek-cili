@@ -7,6 +7,9 @@ nodes from fighting over the same shared status dict*
 *Version: Multi-leaf detection - detects EACH leaf as its own bounding box
 and reports a per-leaf + overall stressed-percentage instead of one box
 for the whole plant*
+*Version: Frame throttling - image preview updates on EVERY frame the
+ESP32-CAM sends (fast, feels like live video), but the heavy leaf-contour +
+disease-model analysis only runs every ANALYZE_EVERY_N_FRAMES frames*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -218,6 +221,24 @@ latest_image_timestamp = None
 sensor_history = []
 max_history = 100
 
+# ========== FRAME THROTTLING (fast image updates, slower heavy analysis) ==========
+# The ESP32-CAM can only ever send still JPEGs (no real video encoder on the
+# chip) - but it can send them fast (e.g. every 1s) so the dashboard LOOKS
+# like a live video feed (MJPEG-style). Running full leaf-contour detection
+# + the TensorFlow model on EVERY single frame at that rate is too heavy for
+# a free-tier server and causes lag/timeouts. So: the raw image is updated
+# and shown on EVERY frame the ESP32 sends, but the expensive analysis
+# (leaf detection, disease model, fertilizer decision) only runs once every
+# ANALYZE_EVERY_N_FRAMES frames. Between analysis frames we reuse the last
+# known result so decisions don't just disappear.
+ANALYZE_EVERY_N_FRAMES = 6  # e.g. ESP32 sends every 1s -> full analysis runs every ~3s
+
+frame_counter = 0
+last_leaf_analysis = None
+last_diagnosis = "Waiting for first analysis..."
+last_disease_confidence = 0.0
+last_has_disease = False
+
 # Global state shared with the ESP32 Node (Pump actuator)
 # NOTE: action_fertilize is ONLY ever written by /detect (ESP32-CAM).
 # /soil (plain ESP32) is only allowed to touch action_water + soil fields.
@@ -246,6 +267,7 @@ def health_check():
 def detect_plant():
     try:
         global latest_image_base64, latest_image_timestamp, current_pump_status, pending_fertilize
+        global frame_counter, last_leaf_analysis, last_diagnosis, last_disease_confidence, last_has_disease
 
         # Get sensor data from HTTP Headers (ESP32-CAM)
         soil_raw = request.headers.get('X-Soil-Raw', type=int, default=2500)
@@ -262,18 +284,40 @@ def detect_plant():
         if img is None:
             return jsonify({"error": "Failed to decode image"}), 400
 
-        # ========== STEP 1: LEAF COLOR ANALYSIS (OPENCV) ==========
-        leaf_analysis = analyze_leaf_health(img)
+        # ========== FRAME THROTTLE DECISION ==========
+        # Every frame updates the live image, but the heavy leaf/disease
+        # analysis only actually runs every ANALYZE_EVERY_N_FRAMES frames
+        # (or immediately on the very first frame ever received).
+        frame_counter += 1
+        run_full_analysis = (last_leaf_analysis is None) or (frame_counter % ANALYZE_EVERY_N_FRAMES == 0)
 
-        # ========== STEP 2: DISEASE DETECTION (AI MODEL / FALLBACK) ==========
-        if model_available and leaf_analysis['is_plant_detected']:
-            disease_result = detect_disease_with_model(img)
+        if run_full_analysis:
+            # ========== STEP 1: LEAF COLOR ANALYSIS (OPENCV) ==========
+            leaf_analysis = analyze_leaf_health(img)
+
+            # ========== STEP 2: DISEASE DETECTION (AI MODEL / FALLBACK) ==========
+            if model_available and leaf_analysis['is_plant_detected']:
+                disease_result = detect_disease_with_model(img)
+            else:
+                disease_result = detect_disease_simple(img, leaf_analysis)
+
+            diagnosis = disease_result['diagnosis']
+            disease_confidence = disease_result['confidence']
+            has_disease = disease_result['has_disease']
+
+            # Cache so skipped frames in between can reuse this result
+            last_leaf_analysis = leaf_analysis
+            last_diagnosis = diagnosis
+            last_disease_confidence = disease_confidence
+            last_has_disease = has_disease
         else:
-            disease_result = detect_disease_simple(img, leaf_analysis)
-
-        diagnosis = disease_result['diagnosis']
-        disease_confidence = disease_result['confidence']
-        has_disease = disease_result['has_disease']
+            # Skip the expensive contour/model work this frame - reuse the
+            # last known analysis so fertilizer/disease decisions stay
+            # consistent instead of resetting every frame.
+            leaf_analysis = last_leaf_analysis
+            diagnosis = last_diagnosis
+            disease_confidence = last_disease_confidence
+            has_disease = last_has_disease
 
         # ========== STEP 3: SMART DECISION LOGIC ==========
         action_water = False
@@ -385,6 +429,7 @@ def detect_plant():
             "num_leaves": leaf_analysis['num_leaves'],
             "num_stressed_leaves": leaf_analysis['num_stressed'],
             "stressed_leaf_percent": leaf_analysis['stressed_percent'],
+            "analyzed_this_frame": run_full_analysis,
             "action_water": action_water,
             "action_fertilize": action_fertilize,
             "alert_disease": alert_disease,
@@ -394,7 +439,11 @@ def detect_plant():
         if len(sensor_history) > max_history:
             sensor_history.pop(0)
 
-        return jsonify({"success": True, "message": "Analysis successful"}), 200
+        return jsonify({
+            "success": True,
+            "message": "Analysis successful" if run_full_analysis else "Image updated (analysis reused from last cycle)",
+            "analyzed_this_frame": run_full_analysis
+        }), 200
 
     except Exception as e:
         logger.error(f"Error: {str(e)}")

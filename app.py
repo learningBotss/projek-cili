@@ -4,6 +4,9 @@ UiTM ITT569 IoT Final Project - CDCS259
 *Version: Fixed fertilizer logic - single source of truth (ESP32-CAM /detect only)*
 */soil endpoint no longer overwrites action_fertilize -> prevents the two ESP32
 nodes from fighting over the same shared status dict*
+*Version: Multi-leaf detection - detects EACH leaf as its own bounding box
+and reports a per-leaf + overall stressed-percentage instead of one box
+for the whole plant*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -279,7 +282,10 @@ def detect_plant():
         decision_reason = ""
 
         soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
-        leaf_is_stressed = leaf_analysis['stress_level'] > 0.5
+        # Plant-wide stress decision now based on the SHARE of leaves that
+        # are individually flagged as stressed, not a single whole-plant
+        # color average. See STRESSED_LEAF_PERCENT_THRESHOLD below.
+        leaf_is_stressed = leaf_analysis['stressed_percent'] > STRESSED_LEAF_PERCENT_THRESHOLD
         needs_fertilizer = leaf_is_stressed or has_disease
 
         # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
@@ -320,6 +326,8 @@ def detect_plant():
                     f_info = get_fertilize_tracker_info()
                     decision_reason += f" | Queued fertilizer dose still on cooldown, {f_info['days_remaining']} day(s) left"
 
+            decision_reason += f" | Leaves detected: {leaf_analysis['num_leaves']}, stressed: {leaf_analysis['num_stressed']} ({leaf_analysis['stressed_percent']:.0f}%)"
+
             if has_disease:
                 alert_disease = True
                 decision_reason += f" | DISEASE ALERT: {diagnosis}"
@@ -336,7 +344,7 @@ def detect_plant():
             else:
                 decision_reason += " | (No plant detected in frame, but water was still given because the soil is dry)"
 
-        # ========== STEP 4: DRAW BOUNDING BOX ==========
+        # ========== STEP 4: DRAW BOUNDING BOX (ONE PER LEAF) ==========
         processed_img = draw_detection_box(img, leaf_analysis, diagnosis)
 
         _, buffer = cv2.imencode('.jpg', processed_img)
@@ -374,6 +382,9 @@ def detect_plant():
             "disease_confidence": disease_confidence,
             "leaf_stress": leaf_analysis['stress_level'],
             "leaf_color_normal": not leaf_analysis['color_abnormal'],
+            "num_leaves": leaf_analysis['num_leaves'],
+            "num_stressed_leaves": leaf_analysis['num_stressed'],
+            "stressed_leaf_percent": leaf_analysis['stressed_percent'],
             "action_water": action_water,
             "action_fertilize": action_fertilize,
             "alert_disease": alert_disease,
@@ -513,52 +524,123 @@ def get_stats():
 
 # ========== PROCESSING FUNCTIONS ==========
 
+# ---- Multi-leaf detection tuning ----
+# Minimum contour area (in pixels) for a green blob to be counted as its own
+# leaf. Too low -> noise/small leaf fragments get counted as separate leaves.
+# Too high -> small/young leaves get ignored. Tune based on camera distance;
+# at VGA (640x480) with the camera ~20-30cm from the plant, 500-1000 is a
+# reasonable starting point.
+MIN_LEAF_AREA = 800
+
+# A leaf is flagged "stressed" if its OWN yellow ratio crosses this.
+LEAF_STRESS_THRESHOLD = 0.5
+
+# Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
+# individually stressed. Replaces the old single whole-plant average check.
+STRESSED_LEAF_PERCENT_THRESHOLD = 40.0
+
 def analyze_leaf_health(img):
+    """
+    Segments the frame into green (leaf) regions, then finds EACH separate
+    leaf blob as its own contour instead of taking only the single largest
+    contour for the whole plant. Each leaf gets its own stress score based
+    on the yellow-pixel ratio inside its own bounding box.
+    """
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
     lower_green = np.array([35, 35, 35])
     upper_green = np.array([85, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
-    green_pixels = cv2.countNonZero(mask_green)
-    total_pixels = img.shape[0] * img.shape[1]
-    green_ratio = green_pixels / total_pixels
+
+    # Morphological clean-up: removes tiny noise specks and closes small gaps
+    # inside a leaf's mask so one physical leaf doesn't get split into
+    # several tiny fake contours.
+    kernel = np.ones((5, 5), np.uint8)
+    mask_clean = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     lower_yellow = np.array([15, 40, 40])
     upper_yellow = np.array([35, 255, 255])
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    yellow_pixels = cv2.countNonZero(mask_yellow)
 
-    stress_level = (yellow_pixels / total_pixels) * 3
-    stress_level = min(stress_level, 1.0)
+    total_pixels = img.shape[0] * img.shape[1]
+    green_pixels = cv2.countNonZero(mask_clean)
+    green_ratio = green_pixels / total_pixels
 
-    is_plant_detected = green_ratio > 0.05 or (yellow_pixels / total_pixels) > 0.05
-    color_abnormal = green_ratio < 0.20 if is_plant_detected else False
+    # ---- Find every individual leaf blob ----
+    contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    leaves = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < MIN_LEAF_AREA:
+            continue  # too small - likely noise, not a real leaf
+
+        x, y, bw, bh = cv2.boundingRect(c)
+
+        # Stress score for THIS leaf only: yellow ratio inside its own box
+        leaf_yellow_mask = mask_yellow[y:y + bh, x:x + bw]
+        leaf_box_pixels = bw * bh
+        leaf_yellow_pixels = cv2.countNonZero(leaf_yellow_mask)
+        leaf_stress_level = min((leaf_yellow_pixels / leaf_box_pixels) * 3, 1.0) if leaf_box_pixels > 0 else 0.0
+
+        leaves.append({
+            "bbox": (x, y, bw, bh),
+            "area": float(area),
+            "stress_level": float(leaf_stress_level),
+            "is_stressed": leaf_stress_level > LEAF_STRESS_THRESHOLD
+        })
+
+    # Largest leaves first (usually the most reliable/least noisy)
+    leaves.sort(key=lambda l: -l["area"])
+
+    num_leaves = len(leaves)
+    num_stressed = sum(1 for l in leaves if l["is_stressed"])
+    stressed_percent = (num_stressed / num_leaves * 100.0) if num_leaves > 0 else 0.0
+    avg_stress_level = (sum(l["stress_level"] for l in leaves) / num_leaves) if num_leaves > 0 else 0.0
+
+    is_plant_detected = num_leaves > 0 or green_ratio > 0.05
 
     return {
-        "stress_level": float(stress_level),
-        "color_abnormal": bool(color_abnormal),
+        "leaves": leaves,                          # list of per-leaf dicts (bbox, stress_level, is_stressed)
+        "num_leaves": num_leaves,
+        "num_stressed": num_stressed,
+        "stressed_percent": float(stressed_percent),
+        "stress_level": float(avg_stress_level),    # kept for backward-compat (used by /stats, simple fallback)
+        "color_abnormal": stressed_percent > STRESSED_LEAF_PERCENT_THRESHOLD,
         "green_ratio": float(green_ratio),
         "is_plant_detected": bool(is_plant_detected),
-        "mask_green": mask_green
+        "mask_green": mask_clean
     }
 
 def draw_detection_box(img, leaf_analysis, diagnosis):
+    """Draws ONE box PER detected leaf (red = stressed, green = healthy),
+    each labelled with that leaf's own stress %, plus a summary bar at the
+    top showing total leaves and overall stressed percentage."""
     output = img.copy()
     h, w, _ = output.shape
 
-    if leaf_analysis['is_plant_detected']:
-        contours, _ = cv2.findContours(leaf_analysis['mask_green'], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            x, y, box_w, box_h = cv2.boundingRect(c)
+    if leaf_analysis['is_plant_detected'] and leaf_analysis['num_leaves'] > 0:
+        for leaf in leaf_analysis['leaves']:
+            x, y, bw, bh = leaf['bbox']
+            is_stressed = leaf['is_stressed']
+            color = (0, 0, 255) if is_stressed else (0, 200, 0)  # BGR: red / green
+            cv2.rectangle(output, (x, y), (x + bw, y + bh), color, 2)
 
-            cv2.rectangle(output, (x, y), (x + box_w, y + box_h), (0, 0, 255), 3)
+            label = f"{'STRESS' if is_stressed else 'OK'} {leaf['stress_level'] * 100:.0f}%"
+            label_y = y - 8 if y - 8 > 12 else y + bh + 16
+            cv2.putText(output, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
-            label = f"{diagnosis}"
-            cv2.putText(output, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        # Summary strip across the top of the frame
+        summary = (f"Leaves: {leaf_analysis['num_leaves']}  |  "
+                   f"Stressed: {leaf_analysis['num_stressed']} "
+                   f"({leaf_analysis['stressed_percent']:.0f}%)")
+        cv2.rectangle(output, (0, 0), (w, 28), (0, 0, 0), -1)
+        cv2.putText(output, summary, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        cv2.putText(output, diagnosis, (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
     else:
         cv2.rectangle(output, (20, 20), (w - 20, h - 20), (0, 165, 255), 2)
-        cv2.putText(output, "SCANNING: No Chili Plant Found", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        cv2.putText(output, "SCANNING: No Chili Leaves Found", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
     return output
 
@@ -584,7 +666,7 @@ def detect_disease_simple(img, leaf_analysis):
     if not leaf_analysis['is_plant_detected']:
         return {"diagnosis": "No Chili Plant Detected", "confidence": 1.0, "has_disease": False}
 
-    if leaf_analysis['stress_level'] > 0.5:
+    if leaf_analysis['stressed_percent'] > STRESSED_LEAF_PERCENT_THRESHOLD:
         return {"diagnosis": "Chili Bell Bacterial Spot (Estimated)", "confidence": 0.70, "has_disease": True}
     return {"diagnosis": "Chili Bell Healthy", "confidence": 0.85, "has_disease": False}
 

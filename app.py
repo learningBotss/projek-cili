@@ -1,7 +1,9 @@
 """
 CHILI STRESS DETECTION BACKEND - PYTHON FLASK
 UiTM ITT569 IoT Final Project - CDCS259
-*Version: Dry-soil alert logic fix + Water daily limit (2x/day) + Fertilizer 7-day cooldown*
+*Version: Fixed fertilizer logic - single source of truth (ESP32-CAM /detect only)*
+*/soil endpoint no longer overwrites action_fertilize -> prevents the two ESP32
+nodes from fighting over the same shared status dict*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -54,15 +56,12 @@ except Exception as e:
 MOISTURE_THRESHOLD_DRY = 30.0
 
 # ========== WATER PUMP: DAILY LIMIT (2x/DAY) ==========
-# Water will be given AS LONG AS the soil is dry, REGARDLESS of whether the
-# chili plant is detected in frame or not. But it's capped at a maximum of
-# 2 times within a 1-day window (resets based on the Malaysia date).
 WATER_DAILY_LIMIT = 2
 
 water_tracker = {
-    "date": None,          # Malaysia date this count applies to
-    "count": 0,             # how many times water has been given today
-    "history_times": []     # list of ISO timestamps water was given today
+    "date": None,
+    "count": 0,
+    "history_times": []
 }
 
 def _reset_water_tracker_if_new_day():
@@ -96,13 +95,17 @@ def reset_water_tracker():
     water_tracker["history_times"] = []
 
 # ========== FERTILIZER PUMP: 7-DAY COOLDOWN ==========
-# Once fertilizer is given, the system will "go quiet" (won't fertilize again)
-# for 7 days, even if stress/disease is detected again, to avoid over-fertilizing.
 FERTILIZE_COOLDOWN_DAYS = 7
 
 fertilize_tracker = {
-    "last_given": None  # datetime object (Malaysia time) of the last fertilizer dose
+    "last_given": None
 }
+
+# Set to True by /detect when stress/disease is seen but soil was too dry to
+# fertilize at that moment. Cleared once fertilizer actually fires, so the
+# next scan (once soil is wet enough) can still act on it instead of losing
+# the window.
+pending_fertilize = False
 
 def can_fertilize_now():
     if fertilize_tracker["last_given"] is None:
@@ -120,7 +123,8 @@ def get_fertilize_tracker_info():
             "days_since": None,
             "cooldown_days": FERTILIZE_COOLDOWN_DAYS,
             "can_fertilize": True,
-            "days_remaining": 0.0
+            "days_remaining": 0.0,
+            "pending": pending_fertilize
         }
     elapsed = get_malaysia_time() - fertilize_tracker["last_given"]
     days_since = elapsed.total_seconds() / 86400.0
@@ -130,11 +134,14 @@ def get_fertilize_tracker_info():
         "days_since": round(days_since, 2),
         "cooldown_days": FERTILIZE_COOLDOWN_DAYS,
         "can_fertilize": days_since >= FERTILIZE_COOLDOWN_DAYS,
-        "days_remaining": round(days_remaining, 2)
+        "days_remaining": round(days_remaining, 2),
+        "pending": pending_fertilize
     }
 
 def reset_fertilize_tracker():
+    global pending_fertilize
     fertilize_tracker["last_given"] = None
+    pending_fertilize = False
 
 # ========== DATA STORAGE ==========
 latest_image_base64 = None
@@ -143,6 +150,8 @@ sensor_history = []
 max_history = 100
 
 # Global state shared with the ESP32 Node (Pump actuator)
+# NOTE: action_fertilize is ONLY ever written by /detect (ESP32-CAM).
+# /soil (plain ESP32) is only allowed to touch action_water + soil fields.
 current_pump_status = {
     "action_water": False,
     "action_fertilize": False,
@@ -167,7 +176,7 @@ def health_check():
 @app.route('/detect', methods=['POST'])
 def detect_plant():
     try:
-        global latest_image_base64, latest_image_timestamp, current_pump_status
+        global latest_image_base64, latest_image_timestamp, current_pump_status, pending_fertilize
 
         # Get sensor data from HTTP Headers (ESP32-CAM)
         soil_raw = request.headers.get('X-Soil-Raw', type=int, default=2500)
@@ -203,13 +212,11 @@ def detect_plant():
         alert_disease = False
         decision_reason = ""
 
-        # NOTE: soil_percent below the threshold is considered fully dry
         soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
         leaf_is_stressed = leaf_analysis['stress_level'] > 0.5
+        needs_fertilizer = leaf_is_stressed or has_disease
 
         # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
-        # Water is given AS LONG AS the soil is dry, REGARDLESS of whether the
-        # chili plant is detected in the camera frame. Capped at 2 times per day.
         if soil_is_dry:
             if can_water_now():
                 action_water = True
@@ -223,15 +230,35 @@ def detect_plant():
             decision_reason = "Soil is moist - watering not needed."
 
         # -------- FERTILIZER PUMP LOGIC (requires plant detection + 7-day cooldown) --------
+        # This block is the ONLY place in the whole app that is allowed to set
+        # action_fertilize. /soil must never touch it.
         if leaf_analysis['is_plant_detected']:
-            if not soil_is_dry and (leaf_is_stressed or has_disease):
+            if needs_fertilizer:
+                if soil_is_dry:
+                    # Can't fertilize dry soil right now, but don't lose the
+                    # signal - remember it so next wet-soil scan can still act.
+                    pending_fertilize = True
+                    decision_reason += " | Plant stressed/diseased but soil is dry -> fertilizer queued until soil is watered"
+                else:
+                    if can_fertilize_now():
+                        action_fertilize = True
+                        pending_fertilize = False
+                        record_fertilize_given()
+                        decision_reason += " | Plant stressed/diseased -> Fertilizer pump ON (7-day cooldown starts now)"
+                    else:
+                        f_info = get_fertilize_tracker_info()
+                        decision_reason += f" | Plant stress/disease detected BUT fertilizer is still on cooldown, {f_info['days_remaining']} day(s) left before it can be given again"
+            elif pending_fertilize and not soil_is_dry:
+                # Stress/disease from a PREVIOUS scan is still pending and soil
+                # has since become wet enough -> act on it now.
                 if can_fertilize_now():
                     action_fertilize = True
+                    pending_fertilize = False
                     record_fertilize_given()
-                    decision_reason += " | Plant stressed/diseased -> Fertilizer pump ON (7-day cooldown starts now)"
+                    decision_reason += " | Soil now wet enough -> firing previously queued fertilizer dose (7-day cooldown starts now)"
                 else:
                     f_info = get_fertilize_tracker_info()
-                    decision_reason += f" | Plant stress/disease detected BUT fertilizer is still on cooldown, {f_info['days_remaining']} day(s) left before it can be given again"
+                    decision_reason += f" | Queued fertilizer dose still on cooldown, {f_info['days_remaining']} day(s) left"
 
             if has_disease:
                 alert_disease = True
@@ -241,7 +268,6 @@ def detect_plant():
                 decision_reason = "All parameters normal - Chili plant is healthy!"
         else:
             # No plant detected (e.g. only the floor/wall is visible)
-            # NOTE: the water pump can STILL run above since it ignores detection.
             diagnosis = "No Chili Plant Detected"
             disease_confidence = 1.0
             has_disease = False
@@ -253,7 +279,6 @@ def detect_plant():
         # ========== STEP 4: DRAW BOUNDING BOX ==========
         processed_img = draw_detection_box(img, leaf_analysis, diagnosis)
 
-        # Convert processed image to Base64 string
         _, buffer = cv2.imencode('.jpg', processed_img)
         latest_image_base64 = base64.b64encode(buffer).decode('utf-8')
         latest_image_timestamp = get_malaysia_time().isoformat()
@@ -266,7 +291,6 @@ def detect_plant():
             "decision_reason": decision_reason
         }
 
-        # Determine the plant's needs based on active pump status
         if action_water and action_fertilize:
             plant_needs = "Need Water & Fertilizer"
         elif action_water:
@@ -276,12 +300,17 @@ def detect_plant():
         else:
             plant_needs = "Optimal (No Action)"
 
-        # Save record to in-memory history
+        # Save record to in-memory history.
+        # NOTE: "diagnosis" keeps the RAW model/heuristic diagnosis (e.g.
+        # "Chili Bell Bacterial Spot") so any future text-matching stays
+        # valid. The human-friendly summary is stored separately as
+        # "plant_needs" instead of overwriting diagnosis like before.
         record = {
             "timestamp": latest_image_timestamp,
             "soil_percent": soil_percent,
             "soil_raw": soil_raw,
-            "diagnosis": plant_needs,  # <--- We send the plant's needs status to the frontend
+            "diagnosis": diagnosis,          # raw diagnosis, e.g. "Chili Bell Bacterial Spot"
+            "plant_needs": plant_needs,       # human-friendly summary for the dashboard
             "disease_confidence": disease_confidence,
             "leaf_stress": leaf_analysis['stress_level'],
             "leaf_color_normal": not leaf_analysis['color_abnormal'],
@@ -302,18 +331,22 @@ def detect_plant():
 
 @app.route('/soil', methods=['POST'])
 def receive_soil_data():
-    """Receives soil moisture data directly from the ESP32 sensor node"""
+    """
+    Receives soil moisture data directly from the plain ESP32 sensor node.
+    IMPORTANT: this endpoint only controls action_water. It must NEVER set
+    action_fertilize - that decision belongs solely to /detect (ESP32-CAM),
+    otherwise the two nodes end up racing to overwrite the same shared
+    current_pump_status dict.
+    """
     try:
         data = request.json
         soil_raw = data.get("soil_raw", 2500)
         soil_percent = data.get("soil_percent", 50.0)
 
-        # Get the last diagnosis, if any
         last_diagnosis = sensor_history[-1]['diagnosis'] if sensor_history else "Waiting for camera"
         last_confidence = sensor_history[-1]['disease_confidence'] if sensor_history else 0.0
         last_stress = sensor_history[-1]['leaf_stress'] if sensor_history else 0.0
 
-        # NOTE: soil_percent below the threshold is considered fully dry
         soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
 
         # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
@@ -330,21 +363,8 @@ def receive_soil_data():
             current_pump_status["action_water"] = False
             current_pump_status["decision_reason"] = "Soil data: Moist - watering not needed."
 
-        # -------- FERTILIZER PUMP LOGIC (7-day cooldown) --------
-        if "Bacterial Spot" in last_diagnosis or last_stress > 0.5:
-            if not soil_is_dry:
-                if can_fertilize_now():
-                    current_pump_status["action_fertilize"] = True
-                    record_fertilize_given()
-                    current_pump_status["decision_reason"] += " | Plant stressed -> Fertilizer pump ON (7-day cooldown starts now)"
-                else:
-                    f_info = get_fertilize_tracker_info()
-                    current_pump_status["action_fertilize"] = False
-                    current_pump_status["decision_reason"] += f" | Plant stress detected BUT fertilizer is still on cooldown, {f_info['days_remaining']} day(s) left"
-            else:
-                current_pump_status["action_fertilize"] = False
-        else:
-            current_pump_status["action_fertilize"] = False
+        # action_fertilize and alert_disease are intentionally left untouched
+        # here - they keep whatever /detect last decided.
 
         record = {
             "timestamp": get_malaysia_time().isoformat(),
@@ -369,17 +389,13 @@ def reset_trackers():
     """
     TESTING-ONLY ENDPOINT.
     Resets the water pump daily limit (2x/day) and/or the fertilizer pump
-    7-day cooldown so you can re-test the logic instantly without waiting
-    for the next day / next 7 days, and without restarting the whole server
-    (history/stats stay intact).
+    7-day cooldown (+ pending_fertilize flag) so you can re-test the logic
+    instantly without waiting for the next day / next 7 days.
 
     Usage:
       - GET  /debug/reset-trackers                 -> resets BOTH trackers
       - GET  /debug/reset-trackers?target=water     -> resets water pump only
       - GET  /debug/reset-trackers?target=fertilize -> resets fertilizer pump only
-
-    This is also called by the "Reset Water Pump" / "Reset Fertilizer Pump"
-    buttons on the dashboard.
     """
     target = request.args.get('target', 'all')
 
@@ -443,7 +459,6 @@ def get_stats():
 def analyze_leaf_health(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # Green color range for chili leaves
     lower_green = np.array([35, 35, 35])
     upper_green = np.array([85, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
@@ -451,7 +466,6 @@ def analyze_leaf_health(img):
     total_pixels = img.shape[0] * img.shape[1]
     green_ratio = green_pixels / total_pixels
 
-    # Yellow color range (sign of stress)
     lower_yellow = np.array([15, 40, 40])
     upper_yellow = np.array([35, 255, 255])
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
@@ -460,7 +474,6 @@ def analyze_leaf_health(img):
     stress_level = (yellow_pixels / total_pixels) * 3
     stress_level = min(stress_level, 1.0)
 
-    # Verify whether the object is actually a chili plant or just empty background
     is_plant_detected = green_ratio > 0.05 or (yellow_pixels / total_pixels) > 0.05
     color_abnormal = green_ratio < 0.20 if is_plant_detected else False
 
@@ -477,21 +490,16 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
     h, w, _ = output.shape
 
     if leaf_analysis['is_plant_detected']:
-        # Find the outer contour of the plant to draw the red detection box
         contours, _ = cv2.findContours(leaf_analysis['mask_green'], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
-            # Take the largest contour
             c = max(contours, key=cv2.contourArea)
             x, y, box_w, box_h = cv2.boundingRect(c)
 
-            # Draw the main red box around the detected leaf area
             cv2.rectangle(output, (x, y), (x + box_w, y + box_h), (0, 0, 255), 3)
 
-            # Label the tag above the red box
             label = f"{diagnosis}"
             cv2.putText(output, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
     else:
-        # If no plant is detected, draw a warning border around the whole feed
         cv2.rectangle(output, (20, 20), (w - 20, h - 20), (0, 165, 255), 2)
         cv2.putText(output, "SCANNING: No Chili Plant Found", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 

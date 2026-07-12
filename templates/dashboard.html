@@ -563,16 +563,16 @@
 
         // Must match the backend's MOISTURE_THRESHOLD_DRY in app.py
         const DRY_THRESHOLD = 30;
-        // How many recent readings to scan through.
-        const SOIL_HISTORY_WINDOW = 15;
-        // If a new reading jumps more than this many % from what's
-        // currently displayed, treat it as a noise spike (loose wire) and
-        // HIDE it completely - the display keeps showing the old value.
-        const MAX_JUMP_PERCENT = 15;
-        // ...unless the same jumped-to value repeats this many times in a
-        // row, in which case it's a real change (not a one-off glitch) and
-        // gets accepted.
-        const CONFIRM_STREAK = 3;
+        // How many recent readings to scan through overall.
+        const SOIL_HISTORY_WINDOW = 20;
+        // Rolling-MAX window: for each point, take the HIGHEST reading in
+        // the last this-many samples, not a majority-vote median. A loose
+        // wire/intermittent contact causes the sensor to occasionally read
+        // FALSELY LOW (near-open-circuit looks like "dry"), not falsely
+        // high - so the noisy value is always the low one. Taking the max
+        // means a spurious low reading (e.g. 45 next to a real 56) never
+        // gets displayed at all, no matter how often it repeats.
+        const SOIL_MAX_WINDOW = 7;
 
         // Tracks the timestamp of the last frame we actually rendered, so
         // we skip re-rendering (and re-triggering the fade transition) on
@@ -647,43 +647,22 @@
             }
         }
 
-        // Same despike logic as before, but returns the FULL sequence of
-        // confirmed values (one per input record) instead of just the
-        // final one - so both the big number AND the history table below
-        // can use identical filtered values, not raw jittery ones.
+        // Rolling maximum filter: for each record, looks at the last
+        // SOIL_MAX_WINDOW readings (including itself) and takes the HIGHEST
+        // one, on the assumption that the loose-wire fault only ever makes
+        // readings drop falsely low, never falsely high. So a spurious low
+        // value (e.g. 45 sitting next to a real 56) never surfaces in the
+        // display - the true/higher reading always wins. Returns one value
+        // per input record, so both the big number AND the history table
+        // use identical filtered values.
         function computeFilteredSoilSeries(records) {
-            if (records.length === 0) return [];
-
+            const values = records.map(r => r.soil_percent);
             const series = [];
-            let confirmed = records[0].soil_percent;
-            series.push(confirmed);
 
-            let pendingValue = null;
-            let pendingCount = 0;
-
-            for (let i = 1; i < records.length; i++) {
-                const reading = records[i].soil_percent;
-                const jump = Math.abs(reading - confirmed);
-
-                if (jump <= MAX_JUMP_PERCENT) {
-                    confirmed = reading;
-                    pendingValue = null;
-                    pendingCount = 0;
-                } else {
-                    if (pendingValue !== null && Math.abs(reading - pendingValue) <= MAX_JUMP_PERCENT) {
-                        pendingCount += 1;
-                    } else {
-                        pendingValue = reading;
-                        pendingCount = 1;
-                    }
-                    if (pendingCount >= CONFIRM_STREAK) {
-                        confirmed = reading;
-                        pendingValue = null;
-                        pendingCount = 0;
-                    }
-                    // else: this reading is fully hidden - keep `confirmed` unchanged
-                }
-                series.push(confirmed);
+            for (let i = 0; i < values.length; i++) {
+                const start = Math.max(0, i - SOIL_MAX_WINDOW + 1);
+                const windowVals = values.slice(start, i + 1);
+                series.push(Math.max(...windowVals));
             }
 
             return series;

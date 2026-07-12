@@ -563,13 +563,16 @@
 
         // Must match the backend's MOISTURE_THRESHOLD_DRY in app.py
         const DRY_THRESHOLD = 30;
-        // How many CONSECUTIVE readings on the same side (dry/wet) are needed
-        // before the dashboard trusts a state change. A single noisy spike
-        // (loose wire jitter, e.g. 0% -> 45% -> 0%) never has 3 in a row, so
-        // it gets ignored completely instead of flipping the display.
-        const REQUIRED_STREAK = 3;
-        // How many recent readings to scan when working out the streak.
-        const SOIL_HISTORY_WINDOW = 10;
+        // How many recent readings to scan through.
+        const SOIL_HISTORY_WINDOW = 15;
+        // If a new reading jumps more than this many % from what's
+        // currently displayed, treat it as a noise spike (loose wire) and
+        // HIDE it completely - the display keeps showing the old value.
+        const MAX_JUMP_PERCENT = 15;
+        // ...unless the same jumped-to value repeats this many times in a
+        // row, in which case it's a real change (not a one-off glitch) and
+        // gets accepted.
+        const CONFIRM_STREAK = 3;
 
         // Tracks the timestamp of the last frame we actually rendered, so
         // we skip re-rendering (and re-triggering the fade transition) on
@@ -644,42 +647,62 @@
             }
         }
 
-        // Hysteresis/debounce smoothing: walks through the recent readings
-        // in order and only flips the "confirmed dry/wet" state once it
-        // sees REQUIRED_STREAK consecutive readings agreeing on a side.
-        // This is recomputed fresh from the growing history array each
-        // call, so it's deterministic and never gets out of sync - but it
-        // behaves like a Schmitt trigger: a lone spike can't move it.
-        function getDebouncedSoilPercent(records) {
+        // Despike filter: walks through recent readings in order. A reading
+        // that jumps more than MAX_JUMP_PERCENT from the currently
+        // "confirmed" (displayed) value is treated as a noise spike and
+        // completely IGNORED - it never touches the display, not even
+        // partially. Only if that jumped-to value repeats CONFIRM_STREAK
+        // times in a row does it get accepted as a real change. Recomputed
+        // fresh from the growing history array each call (deterministic,
+        // no drift/state bugs).
+        function getFilteredSoilPercent(records) {
             const sample = records.slice(-SOIL_HISTORY_WINDOW);
             if (sample.length === 0) return 0;
 
-            let confirmedDry = true; // assume dry until proven otherwise
-            let lastSide = null;
-            let streak = 0;
+            let confirmed = sample[0].soil_percent;
+            let pendingValue = null;
+            let pendingCount = 0;
 
-            sample.forEach(r => {
-                const side = r.soil_percent < DRY_THRESHOLD ? 'dry' : 'wet';
-                if (side === lastSide) {
-                    streak += 1;
+            for (let i = 1; i < sample.length; i++) {
+                const reading = sample[i].soil_percent;
+                const jump = Math.abs(reading - confirmed);
+
+                if (jump <= MAX_JUMP_PERCENT) {
+                    // Small, believable change from what's on screen - accept it.
+                    confirmed = reading;
+                    pendingValue = null;
+                    pendingCount = 0;
+                    continue;
+                }
+
+                // Big jump - could be noise, could be a real change. Don't
+                // trust it yet. Only count it if it's consistent with the
+                // previous "pending" candidate.
+                if (pendingValue !== null && Math.abs(reading - pendingValue) <= MAX_JUMP_PERCENT) {
+                    pendingCount += 1;
                 } else {
-                    lastSide = side;
-                    streak = 1;
+                    pendingValue = reading;
+                    pendingCount = 1;
                 }
-                if (streak >= REQUIRED_STREAK) {
-                    confirmedDry = (side === 'dry');
-                }
-            });
 
-            const latestRaw = sample[sample.length - 1].soil_percent;
-            return confirmedDry ? 0 : Math.round(latestRaw);
+                if (pendingCount >= CONFIRM_STREAK) {
+                    // Same "new" value showed up enough times in a row -
+                    // this is a real change, not a glitch. Accept it.
+                    confirmed = reading;
+                    pendingValue = null;
+                    pendingCount = 0;
+                }
+                // else: this reading is fully hidden - display stays at `confirmed`
+            }
+
+            return Math.round(confirmed);
         }
 
         function updateDashboard(data) {
             if (!data.data || data.data.length === 0) return;
             const latest = data.data[data.data.length - 1];
 
-            const soilPercent = getDebouncedSoilPercent(data.data);
+            const soilPercent = getFilteredSoilPercent(data.data);
             document.getElementById('soilPercent').textContent = soilPercent + '%';
             document.getElementById('soilProgressBar').style.width = soilPercent + '%';
 

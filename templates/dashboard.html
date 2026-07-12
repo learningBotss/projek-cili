@@ -647,55 +647,53 @@
             }
         }
 
-        // Despike filter: walks through recent readings in order. A reading
-        // that jumps more than MAX_JUMP_PERCENT from the currently
-        // "confirmed" (displayed) value is treated as a noise spike and
-        // completely IGNORED - it never touches the display, not even
-        // partially. Only if that jumped-to value repeats CONFIRM_STREAK
-        // times in a row does it get accepted as a real change. Recomputed
-        // fresh from the growing history array each call (deterministic,
-        // no drift/state bugs).
-        function getFilteredSoilPercent(records) {
-            const sample = records.slice(-SOIL_HISTORY_WINDOW);
-            if (sample.length === 0) return 0;
+        // Same despike logic as before, but returns the FULL sequence of
+        // confirmed values (one per input record) instead of just the
+        // final one - so both the big number AND the history table below
+        // can use identical filtered values, not raw jittery ones.
+        function computeFilteredSoilSeries(records) {
+            if (records.length === 0) return [];
 
-            let confirmed = sample[0].soil_percent;
+            const series = [];
+            let confirmed = records[0].soil_percent;
+            series.push(confirmed);
+
             let pendingValue = null;
             let pendingCount = 0;
 
-            for (let i = 1; i < sample.length; i++) {
-                const reading = sample[i].soil_percent;
+            for (let i = 1; i < records.length; i++) {
+                const reading = records[i].soil_percent;
                 const jump = Math.abs(reading - confirmed);
 
                 if (jump <= MAX_JUMP_PERCENT) {
-                    // Small, believable change from what's on screen - accept it.
                     confirmed = reading;
                     pendingValue = null;
                     pendingCount = 0;
-                    continue;
-                }
-
-                // Big jump - could be noise, could be a real change. Don't
-                // trust it yet. Only count it if it's consistent with the
-                // previous "pending" candidate.
-                if (pendingValue !== null && Math.abs(reading - pendingValue) <= MAX_JUMP_PERCENT) {
-                    pendingCount += 1;
                 } else {
-                    pendingValue = reading;
-                    pendingCount = 1;
+                    if (pendingValue !== null && Math.abs(reading - pendingValue) <= MAX_JUMP_PERCENT) {
+                        pendingCount += 1;
+                    } else {
+                        pendingValue = reading;
+                        pendingCount = 1;
+                    }
+                    if (pendingCount >= CONFIRM_STREAK) {
+                        confirmed = reading;
+                        pendingValue = null;
+                        pendingCount = 0;
+                    }
+                    // else: this reading is fully hidden - keep `confirmed` unchanged
                 }
-
-                if (pendingCount >= CONFIRM_STREAK) {
-                    // Same "new" value showed up enough times in a row -
-                    // this is a real change, not a glitch. Accept it.
-                    confirmed = reading;
-                    pendingValue = null;
-                    pendingCount = 0;
-                }
-                // else: this reading is fully hidden - display stays at `confirmed`
+                series.push(confirmed);
             }
 
-            return Math.round(confirmed);
+            return series;
+        }
+
+        function getFilteredSoilPercent(records) {
+            const sample = records.slice(-SOIL_HISTORY_WINDOW);
+            const series = computeFilteredSoilSeries(sample);
+            if (series.length === 0) return 0;
+            return Math.round(series[series.length - 1]);
         }
 
         function updateDashboard(data) {
@@ -756,17 +754,30 @@
 
             const tbody = document.getElementById('historyTable');
             tbody.innerHTML = '';
-            data.data.slice(-5).reverse().forEach(r => {
-                const rTime = new Date(r.timestamp).toLocaleTimeString('en-MY', {timeZone: 'Asia/Kuala_Lumpur'});
-                let act = [];
-                if (r.action_water) act.push('Water ON');
-                if (r.action_fertilize) act.push('Fert ON');
-                if (act.length === 0) act.push('None');
 
-                const row = document.createElement('tr');
-                row.innerHTML = `<td>${rTime}</td><td>${Math.round(r.soil_percent)}%</td><td>${r.diagnosis}</td><td>${act.join(', ')}</td>`;
-                tbody.appendChild(row);
-            });
+            // Compute the filtered series ONCE over the same window used for
+            // the big number above, so the table's "Moisture Map %" column
+            // shows the exact same de-spiked values - no more raw 45/56/45
+            // flicker in the logs while the card above shows a stable number.
+            const recentRecords = data.data.slice(-SOIL_HISTORY_WINDOW);
+            const filteredSeries = computeFilteredSoilSeries(recentRecords);
+
+            const lastFive = recentRecords.slice(-5);
+            const lastFiveFiltered = filteredSeries.slice(-5);
+
+            lastFive.map((r, i) => ({ record: r, filteredSoil: lastFiveFiltered[i] }))
+                .reverse()
+                .forEach(({ record: r, filteredSoil }) => {
+                    const rTime = new Date(r.timestamp).toLocaleTimeString('en-MY', {timeZone: 'Asia/Kuala_Lumpur'});
+                    let act = [];
+                    if (r.action_water) act.push('Water ON');
+                    if (r.action_fertilize) act.push('Fert ON');
+                    if (act.length === 0) act.push('None');
+
+                    const row = document.createElement('tr');
+                    row.innerHTML = `<td>${rTime}</td><td>${Math.round(filteredSoil)}%</td><td>${r.diagnosis}</td><td>${act.join(', ')}</td>`;
+                    tbody.appendChild(row);
+                });
         }
 
         function updateStats(stats) {

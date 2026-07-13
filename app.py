@@ -10,6 +10,13 @@ for the whole plant*
 *Version: Frame throttling - image preview updates on EVERY frame the
 ESP32-CAM sends (fast, feels like live video), but the heavy leaf-contour +
 disease-model analysis only runs every ANALYZE_EVERY_N_FRAMES frames*
+*Version: YOLOv8-cls integration - per-leaf stress classification now uses
+a trained yolov8n-cls.pt model (healthy_leaf / stressed_leaf) instead of the
+yellow-pixel-ratio heuristic. OpenCV contours are still used to FIND each
+leaf's bounding box; YOLO is only used to CLASSIFY the crop. Falls back to
+the old yellow-ratio heuristic automatically if the YOLO model fails to load.
+The whole-plant disease CNN (plant_disease_model.h5) is kept as-is and runs
+independently for disease alerting (separate concern from per-leaf stress).*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -38,7 +45,7 @@ MY_TIMEZONE = pytz.timezone('Asia/Kuala_Lumpur')
 def get_malaysia_time():
     return datetime.now(MY_TIMEZONE)
 
-# ========== LOAD PRE-TRAINED MODEL ==========
+# ========== LOAD PRE-TRAINED CNN MODEL (WHOLE-PLANT DISEASE) ==========
 MODEL_PATH = "plant_disease_model.h5"
 CLASS_NAMES = [
     "Chili Bell Bacterial Spot",  # Index 0 (Diseased)
@@ -56,6 +63,47 @@ try:
 except Exception as e:
     logger.warning(f"Failed to load model: {str(e)}. Using OpenCV fallback.")
     model_available = False
+
+# ========== LOAD YOLOv8-CLS MODEL (PER-LEAF STRESS CLASSIFICATION) ==========
+# Trained on 2 classes: healthy_leaf / stressed_leaf. Used to classify each
+# individually-cropped leaf found by the OpenCV contour step below - OpenCV
+# still does the FINDING (bounding boxes), YOLO does the CLASSIFYING.
+YOLO_MODEL_PATH = "yolov8n-cls.pt"
+
+try:
+    from ultralytics import YOLO
+    if os.path.exists(YOLO_MODEL_PATH):
+        yolo_model = YOLO(YOLO_MODEL_PATH)
+        yolo_available = True
+        logger.info(f"YOLOv8-cls model loaded successfully! Classes: {yolo_model.names}")
+    else:
+        logger.warning(f"{YOLO_MODEL_PATH} not found. Using yellow-ratio fallback for leaf stress.")
+        yolo_available = False
+except Exception as e:
+    logger.warning(f"Failed to load YOLOv8-cls model: {str(e)}. Using yellow-ratio fallback.")
+    yolo_available = False
+
+def classify_leaf_yolo(crop_img):
+    """
+    Runs yolov8n-cls.pt on a single cropped leaf image.
+    Returns (label, confidence, is_stressed).
+    Name-based lookup (not index-based) so it stays correct regardless of
+    which class index was 0 vs 1 during training.
+    """
+    if crop_img is None or crop_img.size == 0:
+        return "unknown", 0.0, False
+
+    try:
+        results = yolo_model.predict(crop_img, verbose=False)
+        r = results[0]
+        top1_idx = r.probs.top1
+        confidence = float(r.probs.top1conf)
+        label = r.names[top1_idx]
+        is_stressed = (label == "stressed_leaf")
+        return label, confidence, is_stressed
+    except Exception as e:
+        logger.warning(f"YOLO classify error: {e}")
+        return "unknown", 0.0, False
 
 # ========== SENSOR THRESHOLDS ==========
 # NOTE: Following the new ESP32 mapping: a LOW percentage (< 30%) means dry soil
@@ -260,6 +308,7 @@ def health_check():
     return jsonify({
         "status": "OK",
         "model_loaded": model_available,
+        "yolo_loaded": yolo_available,
         "timestamp": get_malaysia_time().isoformat()
     }), 200
 
@@ -292,10 +341,10 @@ def detect_plant():
         run_full_analysis = (last_leaf_analysis is None) or (frame_counter % ANALYZE_EVERY_N_FRAMES == 0)
 
         if run_full_analysis:
-            # ========== STEP 1: LEAF COLOR ANALYSIS (OPENCV) ==========
+            # ========== STEP 1: LEAF DETECTION (OPENCV) + STRESS CLASSIFICATION (YOLOv8-cls) ==========
             leaf_analysis = analyze_leaf_health(img)
 
-            # ========== STEP 2: DISEASE DETECTION (AI MODEL / FALLBACK) ==========
+            # ========== STEP 2: WHOLE-PLANT DISEASE DETECTION (CNN MODEL / FALLBACK) ==========
             if model_available and leaf_analysis['is_plant_detected']:
                 disease_result = detect_disease_with_model(img)
             else:
@@ -327,8 +376,8 @@ def detect_plant():
 
         soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
         # Plant-wide stress decision now based on the SHARE of leaves that
-        # are individually flagged as stressed, not a single whole-plant
-        # color average. See STRESSED_LEAF_PERCENT_THRESHOLD below.
+        # are individually flagged as stressed (via YOLOv8-cls per-leaf
+        # classification), not a single whole-plant color average.
         leaf_is_stressed = leaf_analysis['stressed_percent'] > STRESSED_LEAF_PERCENT_THRESHOLD
         needs_fertilizer = leaf_is_stressed or has_disease
 
@@ -429,6 +478,7 @@ def detect_plant():
             "num_leaves": leaf_analysis['num_leaves'],
             "num_stressed_leaves": leaf_analysis['num_stressed'],
             "stressed_leaf_percent": leaf_analysis['stressed_percent'],
+            "yolo_used": yolo_available,
             "analyzed_this_frame": run_full_analysis,
             "action_water": action_water,
             "action_fertilize": action_fertilize,
@@ -582,6 +632,9 @@ def get_stats():
 MIN_LEAF_AREA = 800
 
 # A leaf is flagged "stressed" if its OWN yellow ratio crosses this.
+# Only used as the FALLBACK heuristic when the YOLOv8-cls model is
+# unavailable - when YOLO is loaded, its healthy_leaf/stressed_leaf
+# prediction is used directly instead.
 LEAF_STRESS_THRESHOLD = 0.5
 
 # Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
@@ -591,9 +644,11 @@ STRESSED_LEAF_PERCENT_THRESHOLD = 40.0
 def analyze_leaf_health(img):
     """
     Segments the frame into green (leaf) regions, then finds EACH separate
-    leaf blob as its own contour instead of taking only the single largest
-    contour for the whole plant. Each leaf gets its own stress score based
-    on the yellow-pixel ratio inside its own bounding box.
+    leaf blob as its own contour (OpenCV - this part is unchanged). Each
+    leaf's bounding box is then CROPPED and classified individually by the
+    YOLOv8-cls model (healthy_leaf / stressed_leaf) instead of the old
+    yellow-pixel-ratio heuristic. If the YOLO model isn't available, falls
+    back to the yellow-ratio heuristic automatically.
     """
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
@@ -619,26 +674,64 @@ def analyze_leaf_health(img):
     # ---- Find every individual leaf blob ----
     contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    leaves = []
+    # Collect valid boxes first so we can batch the YOLO inference (much
+    # faster than calling .predict() once per leaf in a loop).
+    valid_boxes = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < MIN_LEAF_AREA:
             continue  # too small - likely noise, not a real leaf
-
         x, y, bw, bh = cv2.boundingRect(c)
+        valid_boxes.append((x, y, bw, bh, float(area)))
 
-        # Stress score for THIS leaf only: yellow ratio inside its own box
-        leaf_yellow_mask = mask_yellow[y:y + bh, x:x + bw]
-        leaf_box_pixels = bw * bh
-        leaf_yellow_pixels = cv2.countNonZero(leaf_yellow_mask)
-        leaf_stress_level = min((leaf_yellow_pixels / leaf_box_pixels) * 3, 1.0) if leaf_box_pixels > 0 else 0.0
+    leaves = []
 
-        leaves.append({
-            "bbox": (x, y, bw, bh),
-            "area": float(area),
-            "stress_level": float(leaf_stress_level),
-            "is_stressed": leaf_stress_level > LEAF_STRESS_THRESHOLD
-        })
+    if yolo_available and len(valid_boxes) > 0:
+        # ---- Batch YOLO classification: one predict() call for all crops ----
+        crops = [img[y:y+bh, x:x+bw] for (x, y, bw, bh, area) in valid_boxes]
+        try:
+            results = yolo_model.predict(crops, verbose=False)
+        except Exception as e:
+            logger.warning(f"YOLO batch predict failed, falling back per-leaf: {e}")
+            results = None
+
+        for i, (x, y, bw, bh, area) in enumerate(valid_boxes):
+            if results is not None:
+                r = results[i]
+                top1_idx = r.probs.top1
+                confidence = float(r.probs.top1conf)
+                label = r.names[top1_idx]
+                is_stressed = (label == "stressed_leaf")
+                leaf_stress_level = confidence if is_stressed else (1.0 - confidence)
+            else:
+                label, confidence, is_stressed = classify_leaf_yolo(img[y:y+bh, x:x+bw])
+                leaf_stress_level = confidence if is_stressed else (1.0 - confidence)
+
+            leaves.append({
+                "bbox": (x, y, bw, bh),
+                "area": area,
+                "label": label,
+                "confidence": confidence,
+                "stress_level": float(leaf_stress_level),
+                "is_stressed": bool(is_stressed)
+            })
+    else:
+        # ---- Fallback: old yellow-ratio heuristic (YOLO not available) ----
+        for (x, y, bw, bh, area) in valid_boxes:
+            leaf_yellow_mask = mask_yellow[y:y+bh, x:x+bw]
+            leaf_box_pixels = bw * bh
+            leaf_yellow_pixels = cv2.countNonZero(leaf_yellow_mask)
+            leaf_stress_level = min((leaf_yellow_pixels / leaf_box_pixels) * 3, 1.0) if leaf_box_pixels > 0 else 0.0
+            is_stressed = leaf_stress_level > LEAF_STRESS_THRESHOLD
+
+            leaves.append({
+                "bbox": (x, y, bw, bh),
+                "area": area,
+                "label": "stressed_leaf" if is_stressed else "healthy_leaf",
+                "confidence": float(leaf_stress_level) if is_stressed else float(1 - leaf_stress_level),
+                "stress_level": float(leaf_stress_level),
+                "is_stressed": bool(is_stressed)
+            })
 
     # Largest leaves first (usually the most reliable/least noisy)
     leaves.sort(key=lambda l: -l["area"])
@@ -651,7 +744,7 @@ def analyze_leaf_health(img):
     is_plant_detected = num_leaves > 0 or green_ratio > 0.05
 
     return {
-        "leaves": leaves,                          # list of per-leaf dicts (bbox, stress_level, is_stressed)
+        "leaves": leaves,                          # list of per-leaf dicts (bbox, label, stress_level, is_stressed)
         "num_leaves": num_leaves,
         "num_stressed": num_stressed,
         "stressed_percent": float(stressed_percent),
@@ -664,8 +757,8 @@ def analyze_leaf_health(img):
 
 def draw_detection_box(img, leaf_analysis, diagnosis):
     """Draws ONE box PER detected leaf (red = stressed, green = healthy),
-    each labelled with that leaf's own stress %, plus a summary bar at the
-    top showing total leaves and overall stressed percentage."""
+    each labelled with that leaf's YOLO label + confidence, plus a summary
+    bar at the top showing total leaves and overall stressed percentage."""
     output = img.copy()
     h, w, _ = output.shape
 
@@ -676,9 +769,9 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
             color = (0, 0, 255) if is_stressed else (0, 200, 0)  # BGR: red / green
             cv2.rectangle(output, (x, y), (x + bw, y + bh), color, 2)
 
-            label = f"{'STRESS' if is_stressed else 'OK'} {leaf['stress_level'] * 100:.0f}%"
+            label_text = f"{leaf.get('label', 'STRESS' if is_stressed else 'OK')} {leaf.get('confidence', leaf['stress_level']) * 100:.0f}%"
             label_y = y - 8 if y - 8 > 12 else y + bh + 16
-            cv2.putText(output, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+            cv2.putText(output, label_text, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
         # Summary strip across the top of the frame
         summary = (f"Leaves: {leaf_analysis['num_leaves']}  |  "
@@ -694,6 +787,9 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
     return output
 
 def detect_disease_with_model(img):
+    """Whole-plant disease diagnosis using the CNN (.h5) model. Independent
+    of the per-leaf YOLO stress classification above - different concern
+    (disease presence vs stress severity)."""
     try:
         img_resized = cv2.resize(img, (224, 224))
         img_normalized = img_resized.astype('float32') / 255.0

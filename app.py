@@ -21,7 +21,7 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 from io import BytesIO
-import onnxruntime as ort
+from ultralytics import YOLO
 import json
 from datetime import datetime, timedelta
 import os
@@ -42,69 +42,26 @@ MY_TIMEZONE = pytz.timezone('Asia/Kuala_Lumpur')
 def get_malaysia_time():
     return datetime.now(MY_TIMEZONE)
 
-# ========== LOAD YOLO CLASSIFICATION MODEL (RAW ONNXRUNTIME) ==========
+# ========== LOAD YOLO CLASSIFICATION MODEL (ONNX) ==========
 # IMPORTANT: this file MUST be your TRAINED + EXPORTED weights
 # (yolov8n.onnx exported from runs/classify/train/weights/best.pt via
 # `model.export(format="onnx")`), not a blank/untrained checkpoint.
-#
-# NOTE: we deliberately do NOT use `from ultralytics import YOLO` here.
-# Importing ultralytics pulls in `torch` as a side effect even when you only
-# want to run an .onnx file - and torch alone can eat 300-400MB+ of RAM just
-# being loaded, before a single image is processed. On Render's free tier
-# (512MB limit) that was enough by itself to cause "Ran out of memory"
-# worker crashes. Talking to onnxruntime directly skips torch entirely and
-# uses a fraction of the RAM.
+# ultralytics' YOLO() class loads .onnx directly - same .predict()/() API as
+# .pt, so nothing else in this file needs to change because of the format.
+# Requires `onnxruntime` to be installed (see requirements.txt).
 MODEL_PATH = "yolov8n.onnx"
-
-onnx_session = None
-onnx_class_names = {}
-onnx_input_name = None
-onnx_input_size = 224  # standard YOLOv8-cls input size
 
 try:
     if os.path.exists(MODEL_PATH):
-        onnx_session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-        onnx_input_name = onnx_session.get_inputs()[0].name
-
-        # Ultralytics embeds the class names dict (e.g. {0: 'healthy', 1:
-        # 'stressed'}) into the onnx file's metadata at export time - read
-        # it back out instead of hardcoding, so it always matches training.
-        meta = onnx_session.get_modelmeta().custom_metadata_map
-        if 'names' in meta:
-            onnx_class_names = eval(meta['names'])  # e.g. "{0: 'healthy', 1: 'stressed'}"
-        else:
-            onnx_class_names = {0: 'healthy', 1: 'stressed'}
-            logger.warning("No 'names' metadata found in onnx file, defaulting to {0:'healthy',1:'stressed'} - verify this matches your training folder order!")
-
-        logger.info(f"ONNX classification model loaded successfully! Classes: {onnx_class_names}")
+        yolo_model = YOLO(MODEL_PATH, task="classify")
+        logger.info("YOLO (ONNX) classification model loaded successfully!")
         model_available = True
     else:
         logger.warning(f"{MODEL_PATH} not found. Using OpenCV fallback (yellow-ratio heuristic).")
         model_available = False
 except Exception as e:
-    logger.warning(f"Failed to load ONNX model: {str(e)}. Using OpenCV fallback.")
+    logger.warning(f"Failed to load YOLO ONNX model: {str(e)}. Using OpenCV fallback.")
     model_available = False
-
-def classify_leaf_onnx(leaf_crop_bgr):
-    """
-    Runs one leaf crop through the ONNX classification model directly via
-    onnxruntime (no ultralytics/torch involved). Returns (predicted_class,
-    confidence) same shape as before.
-    """
-    img_resized = cv2.resize(leaf_crop_bgr, (onnx_input_size, onnx_input_size))
-    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-    img_norm = img_rgb.astype(np.float32) / 255.0
-    img_chw = np.transpose(img_norm, (2, 0, 1))  # HWC -> CHW
-    img_batch = np.expand_dims(img_chw, axis=0)  # add batch dim
-
-    outputs = onnx_session.run(None, {onnx_input_name: img_batch})
-    probs = outputs[0][0]  # first output, first (only) batch item
-
-    top_idx = int(np.argmax(probs))
-    confidence = float(probs[top_idx])
-    pred_class = onnx_class_names.get(top_idx, str(top_idx))
-
-    return pred_class, confidence
 
 # ========== SENSOR THRESHOLDS ==========
 # NOTE: Following the new ESP32 mapping: a LOW percentage (< 30%) means dry soil
@@ -332,13 +289,6 @@ def detect_plant():
 
         if img is None:
             return jsonify({"error": "Failed to decode image"}), 400
-
-        # Downscale from VGA (640x480) to 320x240 before any processing.
-        # Smaller frame = smaller leaf crops = less RAM per ONNX inference
-        # call and faster contour detection. The ESP32 still sends VGA (for
-        # decent stream preview quality) but we don't need full resolution
-        # for the health analysis itself.
-        img = cv2.resize(img, (320, 240))
 
         # ========== FRAME THROTTLE DECISION ==========
         # Every frame updates the live image, but the heavy leaf/YOLO
@@ -638,7 +588,7 @@ def get_stats():
 # Too high -> small/young leaves get ignored. Tune based on camera distance;
 # at VGA (640x480) with the camera ~20-30cm from the plant, 500-1000 is a
 # reasonable starting point.
-MIN_LEAF_AREA = 200  # lowered from 800 to match the smaller 320x240 frame (was tuned for 640x480)
+MIN_LEAF_AREA = 800
 
 # Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
 # individually stressed.
@@ -689,14 +639,16 @@ def analyze_leaf_health(img):
 
         if model_available and leaf_crop.size > 0:
             try:
-                pred_class, pred_conf = classify_leaf_onnx(leaf_crop)
+                result = yolo_model(leaf_crop, verbose=False)
+                pred_class = result[0].names[result[0].probs.top1]
+                pred_conf = float(result[0].probs.top1conf)
 
                 is_stressed = (pred_class == "stressed")
                 # Use confidence as the "stress level" score (0-1), consistent
                 # with how the rest of the app (history, /stats) expects it.
                 leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
             except Exception as e:
-                logger.warning(f"ONNX predict failed on leaf crop: {str(e)}")
+                logger.warning(f"YOLO predict failed on leaf crop: {str(e)}")
         else:
             # Fallback if model failed to load: assume healthy so the app
             # doesn't crash / spam fertilizer with no real signal.

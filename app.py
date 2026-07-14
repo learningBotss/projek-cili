@@ -42,26 +42,29 @@ MY_TIMEZONE = pytz.timezone('Asia/Kuala_Lumpur')
 def get_malaysia_time():
     return datetime.now(MY_TIMEZONE)
 
-# ========== LOAD YOLO CLASSIFICATION MODEL (ONNX) ==========
-# IMPORTANT: this file MUST be your TRAINED + EXPORTED weights
-# (yolov8n.onnx exported from runs/classify/train/weights/best.pt via
-# `model.export(format="onnx")`), not a blank/untrained checkpoint.
-# ultralytics' YOLO() class loads .onnx directly - same .predict()/() API as
-# .pt, so nothing else in this file needs to change because of the format.
-# Requires `onnxruntime` to be installed (see requirements.txt).
-MODEL_PATH = "yolov8n.onnx"
+# ========== LOAD YOLO CLASSIFICATION MODEL (.pt via ultralytics) ==========
+# Now running on Cloud Run with an NVIDIA L4 GPU + 16GB RAM, so we can go
+# back to the full ultralytics + torch stack and even use GPU acceleration
+# for inference - no more need for the RAM-saving raw onnxruntime workaround
+# from the Render free-tier days.
+MODEL_PATH = "yolov8n.pt"
 
 try:
     if os.path.exists(MODEL_PATH):
-        yolo_model = YOLO(MODEL_PATH, task="classify")
-        logger.info("YOLO (ONNX) classification model loaded successfully!")
+        yolo_model = YOLO(MODEL_PATH)
+        # Use GPU if available (device 0 = first GPU), otherwise falls back to CPU
+        import torch
+        device = 0 if torch.cuda.is_available() else 'cpu'
+        logger.info(f"YOLO (.pt) classification model loaded successfully! Using device: {device}")
         model_available = True
     else:
         logger.warning(f"{MODEL_PATH} not found. Using OpenCV fallback (yellow-ratio heuristic).")
         model_available = False
+        device = 'cpu'
 except Exception as e:
-    logger.warning(f"Failed to load YOLO ONNX model: {str(e)}. Using OpenCV fallback.")
+    logger.warning(f"Failed to load YOLO model: {str(e)}. Using OpenCV fallback.")
     model_available = False
+    device = 'cpu'
 
 # ========== SENSOR THRESHOLDS ==========
 # NOTE: Following the new ESP32 mapping: a LOW percentage (< 30%) means dry soil
@@ -588,7 +591,7 @@ def get_stats():
 # Too high -> small/young leaves get ignored. Tune based on camera distance;
 # at VGA (640x480) with the camera ~20-30cm from the plant, 500-1000 is a
 # reasonable starting point.
-MIN_LEAF_AREA = 800
+MIN_LEAF_AREA = 800  # tuned for full VGA (640x480) resolution
 
 # Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
 # individually stressed.
@@ -639,7 +642,7 @@ def analyze_leaf_health(img):
 
         if model_available and leaf_crop.size > 0:
             try:
-                result = yolo_model(leaf_crop, verbose=False)
+                result = yolo_model(leaf_crop, verbose=False, device=device)
                 pred_class = result[0].names[result[0].probs.top1]
                 pred_conf = float(result[0].probs.top1conf)
 

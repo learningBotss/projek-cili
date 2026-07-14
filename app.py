@@ -18,6 +18,13 @@ and the old TensorFlow .h5 model*
 (0 = Healthy, 1 = Stressed) instead of a fragile string comparison against
 the literal word "stressed", which was silently failing and causing every
 leaf to be reported as healthy regardless of what the model actually saw*
+*Version: Watershed leaf separation + non-leaf shape filtering - previously,
+touching/overlapping leaves were merged into ONE big bounding box by
+MORPH_CLOSE + RETR_EXTERNAL. Now uses a distance-transform + watershed
+step to split touching leaf blobs into individual leaves, and adds a
+solidity/extent shape check so non-leaf green blobs (pots, background,
+noise) don't get boxed at all. Also: healthy leaf labels no longer show a
+"0%" percentage - just "OK".*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -245,7 +252,11 @@ max_history = 100
 # (leaf detection, YOLO classification, fertilizer decision) only runs once
 # every ANALYZE_EVERY_N_FRAMES frames. Between analysis frames we reuse the
 # last known result so decisions don't just disappear.
-ANALYZE_EVERY_N_FRAMES = 3  # e.g. ESP32 sends every 1s -> full analysis runs every ~3s
+#
+# NOTE: if the bounding boxes/labels on the dashboard look "stuck" and not
+# updating, this is the value to lower first (try 1 or 2). Lower = more
+# responsive but heavier on the server.
+ANALYZE_EVERY_N_FRAMES = 2  # e.g. ESP32 sends every 1s -> full analysis runs every ~2s
 
 frame_counter = 0
 last_leaf_analysis = None
@@ -306,7 +317,7 @@ def detect_plant():
         run_full_analysis = (last_leaf_analysis is None) or (frame_counter % ANALYZE_EVERY_N_FRAMES == 0)
 
         if run_full_analysis:
-            # ========== STEP 1: LEAF SEGMENTATION (OPENCV) + PER-LEAF YOLO CLASSIFICATION ==========
+            # ========== STEP 1: LEAF SEGMENTATION (OPENCV + WATERSHED) + PER-LEAF YOLO CLASSIFICATION ==========
             leaf_analysis = analyze_leaf_health(img)
 
             # ========== STEP 2: OVERALL DIAGNOSIS DERIVED FROM PER-LEAF RESULTS ==========
@@ -596,58 +607,153 @@ def get_stats():
 # Too high -> small/young leaves get ignored. Tune based on camera distance;
 # at VGA (640x480) with the camera ~20-30cm from the plant, 500-1000 is a
 # reasonable starting point.
-MIN_LEAF_AREA = 800  # NOTE: no longer used - was for the old OpenCV contour
-                      # approach, kept here in case that fallback is needed later
+MIN_LEAF_AREA = 800  # tuned for full VGA (640x480) resolution
 
 # Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
 # individually stressed.
 STRESSED_LEAF_PERCENT_THRESHOLD = 40.0
 
+# ---- Shape filter (rejects non-leaf green blobs: pots, background, noise) ----
+# solidity = contour_area / convex_hull_area. Real leaves (even elongated
+# chili leaves) tend to be fairly convex -> high solidity. Weird jagged
+# noise blobs or a sliver of green background have low solidity.
+MIN_LEAF_SOLIDITY = 0.55
+# extent = contour_area / bounding_box_area. Catches thin line-like slivers
+# that have a big bounding box but very little actual filled area.
+MIN_LEAF_EXTENT = 0.25
+
+# ---- Watershed tuning ----
+# Fraction of the max distance-transform value used to pick "sure foreground"
+# seeds. Lower -> more/smaller seeds -> more aggressive splitting into more
+# leaves (risk of over-splitting one leaf into two). Higher -> fewer, larger
+# seeds -> more conservative splitting (risk of leaving leaves merged).
+WATERSHED_FG_THRESHOLD_RATIO = 0.45
+
+def _is_leaf_shape(contour, area):
+    """Shape-based sanity check: rejects blobs that don't look like a leaf
+    (pots, walls, thin slivers of stray green, etc) so they never get boxed
+    or shown to the user."""
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = (area / hull_area) if hull_area > 0 else 0.0
+
+    x, y, bw, bh = cv2.boundingRect(contour)
+    box_area = bw * bh
+    extent = (area / box_area) if box_area > 0 else 0.0
+
+    return solidity >= MIN_LEAF_SOLIDITY and extent >= MIN_LEAF_EXTENT
+
 def analyze_leaf_health(img):
     """
-    Runs the trained YOLO object-DETECTION model DIRECTLY on the full frame.
+    Segments the frame into green (leaf) regions using OpenCV, then applies
+    a distance-transform + watershed step to split any touching/overlapping
+    leaves into separate blobs (previously, close leaves got merged into
+    ONE big bounding box by MORPH_CLOSE + RETR_EXTERNAL alone).
 
-    The model itself finds AND localizes each individual leaf (its own
-    bounding box) and classifies it (0 = Healthy, 1 = Stressed) in one pass -
-    this matches exactly what the Colab test notebook showed (many tight
-    boxes, one per leaf, each labelled 0/1).
+    Every resulting blob is shape-checked (solidity + extent) to reject
+    anything that isn't actually leaf-shaped, so non-leaf green regions
+    (pots, background, thin noise) never get boxed.
 
-    The OLD approach used OpenCV green-color contours to guess WHERE leaves
-    were, cropped each blob, then asked YOLO to just classify that crop.
-    That caused two visible bugs:
-      1. Non-leaf areas (walls, monitor, floor) got boxed - OpenCV's HSV
-         green-mask was loose enough to treat gray/dark surfaces as "leaf".
-      2. One giant box covering the whole plant + background - when leaves
-         touched/overlapped in frame, OpenCV's morphological closing fused
-         them into a single contour, and a bounding rectangle around an
-         irregular blob always includes the non-leaf gaps inside it.
-    Since the Roboflow model was trained on labelled bounding boxes (an
-    object-detection model, not a classifier), letting YOLO detect leaves
-    itself avoids both problems entirely.
+    Each surviving leaf blob is then CROPPED and passed to the trained YOLO
+    classification model, which decides healthy/stressed for that leaf on
+    its own.
     """
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    lower_green = np.array([35, 35, 35])
+    upper_green = np.array([85, 255, 255])
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+    # Morphological clean-up: removes tiny noise specks. NOTE: MORPH_CLOSE
+    # iterations kept low (1x) - watershed below handles separating leaves
+    # that are genuinely touching, so we don't need an aggressive close
+    # that used to weld separate leaves into one blob.
+    kernel = np.ones((5, 5), np.uint8)
+    mask_clean = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    total_pixels = img.shape[0] * img.shape[1]
+    green_pixels = cv2.countNonZero(mask_clean)
+    green_ratio = green_pixels / total_pixels
+
+    # ---- Split touching leaf blobs using distance transform + watershed ----
+    dist_transform = cv2.distanceTransform(mask_clean, cv2.DIST_L2, 5)
+    leaf_contours = []
+
+    if dist_transform.max() > 0:
+        _, sure_fg = cv2.threshold(
+            dist_transform, WATERSHED_FG_THRESHOLD_RATIO * dist_transform.max(), 255, 0
+        )
+        sure_fg = np.uint8(sure_fg)
+        unknown = cv2.subtract(mask_clean, sure_fg)
+
+        num_markers, markers = cv2.connectedComponents(sure_fg)
+        markers = markers + 1  # so background isn't 0 (watershed reserves 0 for "unknown")
+        markers[unknown == 255] = 0
+
+        markers = cv2.watershed(img.copy(), markers)
+
+        # Build a contour for each watershed region (label 1 = background,
+        # -1 = watershed boundary lines - both skipped)
+        for label in range(2, num_markers + 1):
+            region_mask = np.uint8(markers == label) * 255
+            if cv2.countNonZero(region_mask) == 0:
+                continue
+            contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                leaf_contours.append(max(contours, key=cv2.contourArea))
+
     leaves = []
+    for c in leaf_contours:
+        area = cv2.contourArea(c)
+        if area < MIN_LEAF_AREA:
+            continue  # too small - likely noise, not a real leaf
 
-    if model_available:
-        try:
-            result = yolo_model(img, verbose=False, device=device)[0]
-            for box in result.boxes:
-                pred_class_idx = int(box.cls[0])
-                pred_conf = float(box.conf[0])
-                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-                bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+        if not _is_leaf_shape(c, area):
+            continue  # wrong shape (pot, background sliver, etc) - don't box it
 
-                # Match by class INDEX (Roboflow mapping: 0 = Healthy, 1 = Stressed)
-                is_stressed = (pred_class_idx == 1)
-                leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
+        x, y, bw, bh = cv2.boundingRect(c)
 
-                leaves.append({
-                    "bbox": (x1, y1, bw, bh),
-                    "area": float(bw * bh),
-                    "stress_level": float(leaf_stress_level),
-                    "is_stressed": is_stressed
-                })
-        except Exception as e:
-            logger.warning(f"YOLO detect failed on frame: {str(e)}")
+        # ---- Crop this leaf out of the frame and classify it with YOLO ----
+        leaf_crop = img[y:y + bh, x:x + bw]
+
+        leaf_stress_level = 0.0
+        is_stressed = False
+
+        if model_available and leaf_crop.size > 0:
+            try:
+                result = yolo_model(leaf_crop, verbose=False, device=device)
+                if len(result[0].boxes) > 0:
+                    top_box = result[0].boxes[0]  # highest-confidence box
+                    pred_class_idx = int(top_box.cls[0])
+                    pred_conf = float(top_box.conf[0])
+                    # Match by class INDEX (not string name) - Roboflow mapping
+                    # for this model: 0 = Healthy, 1 = Stressed. The old code
+                    # compared result[0].names[idx] == "stressed", which
+                    # silently failed whenever Roboflow's actual class name
+                    # string didn't match exactly (different case, wording,
+                    # etc), causing every leaf to be reported as healthy.
+                    is_stressed = (pred_class_idx == 1)
+                    leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
+                else:
+                    # nothing detected in this crop - assume healthy
+                    is_stressed = False
+                    leaf_stress_level = 0.0
+
+            except Exception as e:
+                logger.warning(f"YOLO predict failed on leaf crop: {str(e)}")
+        else:
+            # Fallback if model failed to load: assume healthy so the app
+            # doesn't crash / spam fertilizer with no real signal.
+            leaf_stress_level = 0.0
+            is_stressed = False
+
+        leaves.append({
+            "bbox": (x, y, bw, bh),
+            "area": float(area),
+            "stress_level": float(leaf_stress_level),
+            "is_stressed": is_stressed
+        })
 
     # Largest leaves first (usually the most reliable/least noisy)
     leaves.sort(key=lambda l: -l["area"])
@@ -666,8 +772,9 @@ def analyze_leaf_health(img):
         "stressed_percent": float(stressed_percent),
         "stress_level": float(avg_stress_level),    # kept for backward-compat (used by /stats)
         "color_abnormal": stressed_percent > STRESSED_LEAF_PERCENT_THRESHOLD,
-        "green_ratio": 0.0,                         # no longer computed - YOLO detects leaves directly now
-        "is_plant_detected": bool(is_plant_detected)
+        "green_ratio": float(green_ratio),
+        "is_plant_detected": bool(is_plant_detected),
+        "mask_green": mask_clean
     }
 
 def draw_detection_box(img, leaf_analysis, diagnosis):
@@ -675,9 +782,8 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
     each labelled with that leaf's own stress %, plus a summary bar at the
     top showing total leaves and overall stressed percentage.
 
-    Unchanged from before - it just reads leaf['is_stressed'] and
-    leaf['stress_level'], which now come from YOLO instead of the yellow-
-    ratio heuristic, so no edits were needed here."""
+    Healthy leaves at/near 0% stress just show "OK" with no percentage,
+    instead of a slightly-misleading "OK 0%"."""
     output = img.copy()
     h, w, _ = output.shape
 
@@ -688,9 +794,12 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
             color = (0, 0, 255) if is_stressed else (0, 200, 0)  # BGR: red / green
             cv2.rectangle(output, (x, y), (x + bw, y + bh), color, 2)
 
-            # Only show a percentage when the leaf is flagged stressed - "OK 0%"
-            # was confusing since 0% reads like a measurement, not a status.
-            label = f"STRESS {leaf['stress_level'] * 100:.0f}%" if is_stressed else "OK"
+            pct = leaf['stress_level'] * 100
+            if is_stressed:
+                label = f"STRESS {pct:.0f}%"
+            else:
+                label = "OK" if pct < 1 else f"OK {pct:.0f}%"
+
             label_y = y - 8 if y - 8 > 12 else y + bh + 16
             cv2.putText(output, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 

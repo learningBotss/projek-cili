@@ -47,7 +47,7 @@ def get_malaysia_time():
 # back to the full ultralytics + torch stack and even use GPU acceleration
 # for inference - no more need for the RAM-saving raw onnxruntime workaround
 # from the Render free-tier days.
-MODEL_PATH = "yolo26n.pt"
+MODEL_PATH = "best.pt"
 
 try:
     if os.path.exists(MODEL_PATH):
@@ -643,13 +643,17 @@ def analyze_leaf_health(img):
         if model_available and leaf_crop.size > 0:
             try:
                 result = yolo_model(leaf_crop, verbose=False, device=device)
-                pred_class = result[0].names[result[0].probs.top1]
-                pred_conf = float(result[0].probs.top1conf)
+                if len(result[0].boxes) > 0:
+                    top_box = result[0].boxes[0]  # box confidence paling tinggi
+                    pred_class = result[0].names[int(top_box.cls[0])]
+                    pred_conf = float(top_box.conf[0])
+                    is_stressed = (pred_class == "stressed")
+                    leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
+                else:
+                    # takde apa detect dalam crop ni — anggap healthy
+                    is_stressed = False
+                    leaf_stress_level = 0.0
 
-                is_stressed = (pred_class == "stressed")
-                # Use confidence as the "stress level" score (0-1), consistent
-                # with how the rest of the app (history, /stats) expects it.
-                leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
             except Exception as e:
                 logger.warning(f"YOLO predict failed on leaf crop: {str(e)}")
         else:

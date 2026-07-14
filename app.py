@@ -10,6 +10,10 @@ for the whole plant*
 *Version: Frame throttling - image preview updates on EVERY frame the
 ESP32-CAM sends (fast, feels like live video), but the heavy leaf-contour +
 disease-model analysis only runs every ANALYZE_EVERY_N_FRAMES frames*
+*Version: YOLO classification - each detected leaf blob (from OpenCV contour)
+is cropped and classified individually by a trained YOLOv8 classification
+model (healthy/stressed) instead of the old yellow-pixel-ratio heuristic
+and the old TensorFlow .h5 model*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -17,7 +21,7 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 from io import BytesIO
-import tensorflow as tf
+from ultralytics import YOLO
 import json
 from datetime import datetime, timedelta
 import os
@@ -38,23 +42,25 @@ MY_TIMEZONE = pytz.timezone('Asia/Kuala_Lumpur')
 def get_malaysia_time():
     return datetime.now(MY_TIMEZONE)
 
-# ========== LOAD PRE-TRAINED MODEL ==========
-MODEL_PATH = "plant_disease_model.h5"
-CLASS_NAMES = [
-    "Chili Bell Bacterial Spot",  # Index 0 (Diseased)
-    "Chili Bell Healthy"          # Index 1 (Healthy)
-]
+# ========== LOAD YOLO CLASSIFICATION MODEL (ONNX) ==========
+# IMPORTANT: this file MUST be your TRAINED + EXPORTED weights
+# (yolov8n.onnx exported from runs/classify/train/weights/best.pt via
+# `model.export(format="onnx")`), not a blank/untrained checkpoint.
+# ultralytics' YOLO() class loads .onnx directly - same .predict()/() API as
+# .pt, so nothing else in this file needs to change because of the format.
+# Requires `onnxruntime` to be installed (see requirements.txt).
+MODEL_PATH = "yolov8n.onnx"
 
 try:
     if os.path.exists(MODEL_PATH):
-        model = tf.keras.models.load_model(MODEL_PATH)
-        logger.info("TensorFlow model (.h5) loaded successfully!")
+        yolo_model = YOLO(MODEL_PATH, task="classify")
+        logger.info("YOLO (ONNX) classification model loaded successfully!")
         model_available = True
     else:
-        logger.warning("plant_disease_model.h5 not found. Using OpenCV fallback.")
+        logger.warning(f"{MODEL_PATH} not found. Using OpenCV fallback (yellow-ratio heuristic).")
         model_available = False
 except Exception as e:
-    logger.warning(f"Failed to load model: {str(e)}. Using OpenCV fallback.")
+    logger.warning(f"Failed to load YOLO ONNX model: {str(e)}. Using OpenCV fallback.")
     model_available = False
 
 # ========== SENSOR THRESHOLDS ==========
@@ -225,12 +231,12 @@ max_history = 100
 # The ESP32-CAM can only ever send still JPEGs (no real video encoder on the
 # chip) - but it can send them fast (e.g. every 1s) so the dashboard LOOKS
 # like a live video feed (MJPEG-style). Running full leaf-contour detection
-# + the TensorFlow model on EVERY single frame at that rate is too heavy for
+# + the YOLO model on EVERY single frame at that rate is too heavy for
 # a free-tier server and causes lag/timeouts. So: the raw image is updated
 # and shown on EVERY frame the ESP32 sends, but the expensive analysis
-# (leaf detection, disease model, fertilizer decision) only runs once every
-# ANALYZE_EVERY_N_FRAMES frames. Between analysis frames we reuse the last
-# known result so decisions don't just disappear.
+# (leaf detection, YOLO classification, fertilizer decision) only runs once
+# every ANALYZE_EVERY_N_FRAMES frames. Between analysis frames we reuse the
+# last known result so decisions don't just disappear.
 ANALYZE_EVERY_N_FRAMES = 3  # e.g. ESP32 sends every 1s -> full analysis runs every ~3s
 
 frame_counter = 0
@@ -285,25 +291,29 @@ def detect_plant():
             return jsonify({"error": "Failed to decode image"}), 400
 
         # ========== FRAME THROTTLE DECISION ==========
-        # Every frame updates the live image, but the heavy leaf/disease
+        # Every frame updates the live image, but the heavy leaf/YOLO
         # analysis only actually runs every ANALYZE_EVERY_N_FRAMES frames
         # (or immediately on the very first frame ever received).
         frame_counter += 1
         run_full_analysis = (last_leaf_analysis is None) or (frame_counter % ANALYZE_EVERY_N_FRAMES == 0)
 
         if run_full_analysis:
-            # ========== STEP 1: LEAF COLOR ANALYSIS (OPENCV) ==========
+            # ========== STEP 1: LEAF SEGMENTATION (OPENCV) + PER-LEAF YOLO CLASSIFICATION ==========
             leaf_analysis = analyze_leaf_health(img)
 
-            # ========== STEP 2: DISEASE DETECTION (AI MODEL / FALLBACK) ==========
-            if model_available and leaf_analysis['is_plant_detected']:
-                disease_result = detect_disease_with_model(img)
+            # ========== STEP 2: OVERALL DIAGNOSIS DERIVED FROM PER-LEAF RESULTS ==========
+            if not leaf_analysis['is_plant_detected']:
+                diagnosis = "No Chili Plant Detected"
+                disease_confidence = 1.0
+                has_disease = False
+            elif leaf_analysis['stressed_percent'] > STRESSED_LEAF_PERCENT_THRESHOLD:
+                diagnosis = "Chili Plant Stressed"
+                disease_confidence = leaf_analysis['stress_level']
+                has_disease = True
             else:
-                disease_result = detect_disease_simple(img, leaf_analysis)
-
-            diagnosis = disease_result['diagnosis']
-            disease_confidence = disease_result['confidence']
-            has_disease = disease_result['has_disease']
+                diagnosis = "Chili Plant Healthy"
+                disease_confidence = 1.0 - leaf_analysis['stress_level']
+                has_disease = False
 
             # Cache so skipped frames in between can reuse this result
             last_leaf_analysis = leaf_analysis
@@ -374,7 +384,7 @@ def detect_plant():
 
             if has_disease:
                 alert_disease = True
-                decision_reason += f" | DISEASE ALERT: {diagnosis}"
+                decision_reason += f" | STRESS ALERT: {diagnosis}"
 
             if not action_water and not action_fertilize and not alert_disease:
                 decision_reason = "All parameters normal - Chili plant is healthy!"
@@ -413,15 +423,14 @@ def detect_plant():
             plant_needs = "Optimal (No Action)"
 
         # Save record to in-memory history.
-        # NOTE: "diagnosis" keeps the RAW model/heuristic diagnosis (e.g.
-        # "Chili Bell Bacterial Spot") so any future text-matching stays
-        # valid. The human-friendly summary is stored separately as
-        # "plant_needs" instead of overwriting diagnosis like before.
+        # NOTE: "diagnosis" keeps the RAW diagnosis (e.g. "Chili Plant Stressed")
+        # so any future text-matching stays valid. The human-friendly summary
+        # is stored separately as "plant_needs" instead of overwriting diagnosis.
         record = {
             "timestamp": latest_image_timestamp,
             "soil_percent": soil_percent,
             "soil_raw": soil_raw,
-            "diagnosis": diagnosis,          # raw diagnosis, e.g. "Chili Bell Bacterial Spot"
+            "diagnosis": diagnosis,          # raw diagnosis, e.g. "Chili Plant Stressed"
             "plant_needs": plant_needs,       # human-friendly summary for the dashboard
             "disease_confidence": disease_confidence,
             "leaf_stress": leaf_analysis['stress_level'],
@@ -581,19 +590,18 @@ def get_stats():
 # reasonable starting point.
 MIN_LEAF_AREA = 800
 
-# A leaf is flagged "stressed" if its OWN yellow ratio crosses this.
-LEAF_STRESS_THRESHOLD = 0.5
-
 # Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
-# individually stressed. Replaces the old single whole-plant average check.
+# individually stressed.
 STRESSED_LEAF_PERCENT_THRESHOLD = 40.0
 
 def analyze_leaf_health(img):
     """
-    Segments the frame into green (leaf) regions, then finds EACH separate
-    leaf blob as its own contour instead of taking only the single largest
-    contour for the whole plant. Each leaf gets its own stress score based
-    on the yellow-pixel ratio inside its own bounding box.
+    Segments the frame into green (leaf) regions using OpenCV contours (this
+    part is unchanged - it just finds WHERE each leaf-shaped blob is).
+
+    Each individual leaf blob is then CROPPED and passed to the trained YOLO
+    classification model, which decides healthy/stressed for that leaf on
+    its own - replacing the old yellow-pixel-ratio heuristic.
     """
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
@@ -607,10 +615,6 @@ def analyze_leaf_health(img):
     kernel = np.ones((5, 5), np.uint8)
     mask_clean = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel, iterations=1)
     mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    lower_yellow = np.array([15, 40, 40])
-    upper_yellow = np.array([35, 255, 255])
-    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
     total_pixels = img.shape[0] * img.shape[1]
     green_pixels = cv2.countNonZero(mask_clean)
@@ -627,17 +631,35 @@ def analyze_leaf_health(img):
 
         x, y, bw, bh = cv2.boundingRect(c)
 
-        # Stress score for THIS leaf only: yellow ratio inside its own box
-        leaf_yellow_mask = mask_yellow[y:y + bh, x:x + bw]
-        leaf_box_pixels = bw * bh
-        leaf_yellow_pixels = cv2.countNonZero(leaf_yellow_mask)
-        leaf_stress_level = min((leaf_yellow_pixels / leaf_box_pixels) * 3, 1.0) if leaf_box_pixels > 0 else 0.0
+        # ---- Crop this leaf out of the frame and classify it with YOLO ----
+        leaf_crop = img[y:y + bh, x:x + bw]
+
+        leaf_stress_level = 0.0
+        is_stressed = False
+
+        if model_available and leaf_crop.size > 0:
+            try:
+                result = yolo_model(leaf_crop, verbose=False)
+                pred_class = result[0].names[result[0].probs.top1]
+                pred_conf = float(result[0].probs.top1conf)
+
+                is_stressed = (pred_class == "stressed")
+                # Use confidence as the "stress level" score (0-1), consistent
+                # with how the rest of the app (history, /stats) expects it.
+                leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
+            except Exception as e:
+                logger.warning(f"YOLO predict failed on leaf crop: {str(e)}")
+        else:
+            # Fallback if model failed to load: assume healthy so the app
+            # doesn't crash / spam fertilizer with no real signal.
+            leaf_stress_level = 0.0
+            is_stressed = False
 
         leaves.append({
             "bbox": (x, y, bw, bh),
             "area": float(area),
             "stress_level": float(leaf_stress_level),
-            "is_stressed": leaf_stress_level > LEAF_STRESS_THRESHOLD
+            "is_stressed": is_stressed
         })
 
     # Largest leaves first (usually the most reliable/least noisy)
@@ -655,7 +677,7 @@ def analyze_leaf_health(img):
         "num_leaves": num_leaves,
         "num_stressed": num_stressed,
         "stressed_percent": float(stressed_percent),
-        "stress_level": float(avg_stress_level),    # kept for backward-compat (used by /stats, simple fallback)
+        "stress_level": float(avg_stress_level),    # kept for backward-compat (used by /stats)
         "color_abnormal": stressed_percent > STRESSED_LEAF_PERCENT_THRESHOLD,
         "green_ratio": float(green_ratio),
         "is_plant_detected": bool(is_plant_detected),
@@ -665,7 +687,11 @@ def analyze_leaf_health(img):
 def draw_detection_box(img, leaf_analysis, diagnosis):
     """Draws ONE box PER detected leaf (red = stressed, green = healthy),
     each labelled with that leaf's own stress %, plus a summary bar at the
-    top showing total leaves and overall stressed percentage."""
+    top showing total leaves and overall stressed percentage.
+
+    Unchanged from before - it just reads leaf['is_stressed'] and
+    leaf['stress_level'], which now come from YOLO instead of the yellow-
+    ratio heuristic, so no edits were needed here."""
     output = img.copy()
     h, w, _ = output.shape
 
@@ -692,32 +718,6 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
         cv2.putText(output, "SCANNING: No Chili Leaves Found", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
     return output
-
-def detect_disease_with_model(img):
-    try:
-        img_resized = cv2.resize(img, (224, 224))
-        img_normalized = img_resized.astype('float32') / 255.0
-        img_batch = np.expand_dims(img_normalized, axis=0)
-
-        predictions = model.predict(img_batch, verbose=0)
-        class_idx = np.argmax(predictions[0])
-        confidence = float(predictions[0][class_idx])
-
-        return {
-            "diagnosis": CLASS_NAMES[class_idx],
-            "confidence": confidence,
-            "has_disease": class_idx == 0
-        }
-    except:
-        return {"diagnosis": "AI Model Error", "confidence": 0.0, "has_disease": False}
-
-def detect_disease_simple(img, leaf_analysis):
-    if not leaf_analysis['is_plant_detected']:
-        return {"diagnosis": "No Chili Plant Detected", "confidence": 1.0, "has_disease": False}
-
-    if leaf_analysis['stressed_percent'] > STRESSED_LEAF_PERCENT_THRESHOLD:
-        return {"diagnosis": "Chili Bell Bacterial Spot (Estimated)", "confidence": 0.70, "has_disease": True}
-    return {"diagnosis": "Chili Bell Healthy", "confidence": 0.85, "has_disease": False}
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

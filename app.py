@@ -2,8 +2,9 @@
 CHILI STRESS DETECTION BACKEND - PYTHON FLASK
 UiTM ITT569 IoT Final Project - CDCS259
 *Version: Multi-leaf detection fixes - watershed separation for touching
-leaves, shape filtering to reject non-leaf green blobs, and hide 0%
-percentage labels*
+leaves, shape filtering to reject non-leaf green blobs, hide 0%
+percentage labels, AND fixed YOLO class index mismatch (match by class
+NAME instead of assuming index 1 = Stressed)*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -33,6 +34,14 @@ def get_malaysia_time():
 
 MODEL_PATH = "best.pt"
 
+# ---- NEW: figure out which class index actually means "stressed" by
+# reading the model's own name mapping, instead of hardcoding index==1.
+# YOLO classification models assign indices based on the ALPHABETICAL
+# ORDER of your training folder names, which may not match what you
+# expect (e.g. "Healthy_Leaf"/"Stressed_Leaf" vs "healthy"/"stressed").
+STRESSED_CLASS_IDX = None
+HEALTHY_CLASS_IDX = None
+
 try:
     if os.path.exists(MODEL_PATH):
         yolo_model = YOLO(MODEL_PATH)
@@ -40,6 +49,28 @@ try:
         device = 0 if torch.cuda.is_available() else 'cpu'
         logger.info(f"YOLO (.pt) classification model loaded successfully! Using device: {device}")
         logger.info(f"Model class names/mapping: {yolo_model.names}")
+
+        # Auto-detect which index is "stressed" vs "healthy" by name,
+        # instead of assuming 0 = Healthy, 1 = Stressed.
+        for idx, name in yolo_model.names.items():
+            name_lower = str(name).lower()
+            if "stress" in name_lower or "disease" in name_lower or "unhealthy" in name_lower:
+                STRESSED_CLASS_IDX = idx
+            elif "healthy" in name_lower or "normal" in name_lower:
+                HEALTHY_CLASS_IDX = idx
+
+        if STRESSED_CLASS_IDX is None:
+            logger.warning(
+                "Could not auto-detect 'stressed' class by name from "
+                f"{yolo_model.names} - falling back to index 1 as stressed. "
+                "Check /debug/model-info and rename your training folders "
+                "to include 'healthy'/'stressed' if this looks wrong."
+            )
+            STRESSED_CLASS_IDX = 1
+
+        logger.info(f"Resolved STRESSED_CLASS_IDX = {STRESSED_CLASS_IDX} "
+                    f"({yolo_model.names.get(STRESSED_CLASS_IDX)})")
+
         model_available = True
     else:
         logger.warning(f"{MODEL_PATH} not found. Using OpenCV fallback (yellow-ratio heuristic).")
@@ -192,6 +223,22 @@ def health_check():
         "status": "OK",
         "model_loaded": model_available,
         "timestamp": get_malaysia_time().isoformat()
+    }), 200
+
+# ---- NEW: debug endpoint so you can check the model's real class
+# mapping straight from the browser, no need to dig through Render logs.
+@app.route('/debug/model-info', methods=['GET'])
+def debug_model_info():
+    if not model_available:
+        return jsonify({"model_loaded": False, "message": "Model not loaded, using OpenCV fallback"}), 200
+    return jsonify({
+        "model_loaded": True,
+        "class_names": yolo_model.names,
+        "resolved_stressed_class_idx": STRESSED_CLASS_IDX,
+        "resolved_stressed_class_name": yolo_model.names.get(STRESSED_CLASS_IDX),
+        "resolved_healthy_class_idx": HEALTHY_CLASS_IDX,
+        "resolved_healthy_class_name": yolo_model.names.get(HEALTHY_CLASS_IDX) if HEALTHY_CLASS_IDX is not None else None,
+        "device": str(device)
     }), 200
 
 @app.route('/detect', methods=['POST'])
@@ -447,7 +494,7 @@ def get_stats():
 
 MIN_LEAF_AREA = 800  # tuned for full VGA (640x480) resolution
 
-# ---- NEW: shape filters to reject non-leaf green blobs ----
+# ---- shape filters to reject non-leaf green blobs ----
 # Leaves are roughly oval/elongated blobs with a fairly "filled-in" outline.
 # Random green background clutter (walls, tarps, reflections) tends to be
 # either very jagged (low solidity) or a shape/aspect ratio that doesn't
@@ -456,7 +503,7 @@ MIN_SOLIDITY = 0.55        # area / convex_hull_area - rejects jagged/irregular 
 MIN_ASPECT_RATIO = 0.15    # width/height - rejects super thin slivers
 MAX_ASPECT_RATIO = 5.0     # width/height - rejects super wide/flat strips
 
-# ---- NEW: watershed tuning ----
+# ---- watershed tuning ----
 # Fraction of the max distance-transform value used to mark "sure foreground"
 # peaks (one peak per leaf). Lower = more/smaller separate leaves detected
 # (good when leaves overlap a lot); higher = fewer, larger merges.
@@ -575,18 +622,22 @@ def analyze_leaf_health(img):
                 # IMPORTANT: best.pt is a CLASSIFICATION model, not a
                 # detection model - ultralytics returns classification
                 # results in result[0].probs (top1 / top1conf), NOT
-                # result[0].boxes. .boxes is always empty for a -cls model,
-                # which was silently forcing every leaf to fall back to
-                # "healthy, 0% confidence" regardless of what the model
-                # actually saw - this is why a leaf could show a "STRESS"
-                # label with 0% confidence, and why the label never seemed
-                # to change between frames.
+                # result[0].boxes. .boxes is always empty for a -cls model.
+                #
+                # FIXED: previously this hardcoded "class index 1 =
+                # Stressed", but YOLO assigns indices based on the
+                # ALPHABETICAL ORDER of your training folder names - if
+                # your folders weren't literally "0_healthy"/"1_stressed"
+                # or similar, index 1 might actually BE healthy, silently
+                # forcing every leaf to read as healthy (0% stress) no
+                # matter what the model saw. Now we match by the class
+                # NAME resolved once at startup (STRESSED_CLASS_IDX),
+                # which is safe regardless of alphabetical ordering.
                 probs = result[0].probs
                 if probs is not None:
                     pred_class_idx = int(probs.top1)
                     pred_conf = float(probs.top1conf)
-                    # 0 = Healthy, 1 = Stressed (match by class index)
-                    is_stressed = (pred_class_idx == 1)
+                    is_stressed = (pred_class_idx == STRESSED_CLASS_IDX)
                     leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
                 else:
                     is_stressed = False

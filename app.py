@@ -8,22 +8,25 @@ nodes from fighting over the same shared status dict*
 and reports a per-leaf + overall stressed-percentage instead of one box
 for the whole plant*
 *Version: Frame throttling - image preview updates on EVERY frame the
-ESP32-CAM sends (fast, feels like live video), but the heavy leaf-contour +
+ESP32-CAM sends (fast, feels like live video), but the heavy leaf-detection +
 disease-model analysis only runs every ANALYZE_EVERY_N_FRAMES frames*
-*Version: YOLO classification - each detected leaf blob (from OpenCV contour)
-is cropped and classified individually by a trained YOLOv8 classification
-model (healthy/stressed) instead of the old yellow-pixel-ratio heuristic
-and the old TensorFlow .h5 model*
+*Version: Direct YOLO detection - the model is run DIRECTLY on the full
+frame (it finds AND localizes each leaf itself, since it was trained as an
+object-detection model on Roboflow, not a classifier), instead of the old
+OpenCV green-contour + crop + classify pipeline, which was causing non-leaf
+areas to get boxed and touching leaves to get fused into one giant box.*
 *Version: FIXED class matching (v2) - no longer hardcodes "0 = Healthy,
-1 = Stressed". Roboflow/YOLO assigns class indices based on whatever order
-classes were created in the labeling project, which is NOT guaranteed to
-match that assumption - this was silently causing every leaf to be reported
-as healthy regardless of what the model actually saw. Now the "stressed"
-index is resolved ONCE at startup by matching the class NAME (see
-STRESSED_CLASS_IDX below), and the detection confidence threshold is
-explicit + tunable instead of relying on the ultralytics default (0.25),
-which can silently drop valid low-confidence "stressed" boxes entirely
-before they ever reach this code.*
+1 = Stressed" as an assumption. Roboflow/YOLO assigns class indices based
+on whatever order classes were created in the labeling project. The
+"stressed" index is now resolved ONCE at startup by matching the class
+NAME (see STRESSED_CLASS_IDX below), falling back to index 1 only if no
+name match is found. The detection confidence threshold is also explicit
+and tunable (DETECT_CONF_THRESHOLD) instead of relying on the ultralytics
+default of 0.25, which can silently drop valid but lower-confidence
+"stressed" boxes before this code ever sees them. Added /debug/model-info
+and /debug/last-detections so the real class mapping and raw per-box
+confidences can be checked directly from the browser instead of digging
+through Render/Cloud Run logs.*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -60,13 +63,16 @@ def get_malaysia_time():
 MODEL_PATH = "best.pt"
 
 # Confidence threshold passed explicitly to yolo_model(). ultralytics
-# defaults to 0.25 if not specified - that's a reasonable general default,
-# but if your "Stressed" class tends to predict with lower confidence
-# (common with smaller/imbalanced training sets), valid stressed boxes can
-# get silently filtered out before they even reach this code's box loop.
-# Lower this (e.g. 0.15) if stress still isn't showing up after the class
-# index fix below, then raise it again once you confirm detection works,
-# to avoid too many false positives.
+# defaults to 0.25 if not specified - reasonable in general, but if the
+# "Stressed" class predicts with lower confidence in real-world footage
+# (common with smaller/imbalanced training sets, or lighting/background
+# that differs from the Roboflow training images), valid stressed boxes
+# can get silently filtered out before they even reach this code's box
+# loop. If stress still doesn't show up after confirming the class index
+# below is correct, temporarily lower this (e.g. 0.05-0.10) and check
+# /debug/last-detections to see the model's RAW confidence for "Stressed"
+# on a leaf you know is stressed - that tells you whether the model is
+# genuinely not seeing it, or just being filtered out too early.
 DETECT_CONF_THRESHOLD = 0.20
 
 STRESSED_CLASS_IDX = None
@@ -105,11 +111,11 @@ try:
 
         model_available = True
     else:
-        logger.warning(f"{MODEL_PATH} not found. Using OpenCV fallback (yellow-ratio heuristic).")
+        logger.warning(f"{MODEL_PATH} not found. No detections will be produced.")
         model_available = False
         device = 'cpu'
 except Exception as e:
-    logger.warning(f"Failed to load YOLO model: {str(e)}. Using OpenCV fallback.")
+    logger.warning(f"Failed to load YOLO model: {str(e)}. No detections will be produced.")
     model_available = False
     device = 'cpu'
 
@@ -158,12 +164,22 @@ def reset_water_tracker():
     water_tracker["history_times"] = []
     watering_session_active = False
 
+# True while a watering dose is actively "in progress" (soil still dry since
+# it was triggered). Prevents the daily count from incrementing again on the
+# very next poll (every 3s) before the soil has had time to actually absorb
+# water - which was cutting doses off almost instantly.
 watering_session_active = False
 
 def handle_water_logic(soil_percent):
     """
     SINGLE SOURCE OF TRUTH for water pump decisions - called by BOTH /detect
     and /soil so the two ESP32 nodes never diverge or double-count doses.
+
+    A daily "dose" is counted ONCE, when watering starts. The pump then stays
+    ON continuously (without re-counting or re-blocking) for as long as the
+    soil reports dry, and only turns OFF once the soil actually becomes
+    moist - instead of counting a fresh dose on every 3-second poll before
+    the water has had a chance to soak in.
     """
     global watering_session_active
     soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
@@ -186,20 +202,36 @@ def handle_water_logic(soil_percent):
 
 # ========== FERTILIZER PUMP: 7-DAY COOLDOWN ==========
 FERTILIZE_COOLDOWN_DAYS = 7
+
+# How long the fertilizer relay should physically stay ON for one dose.
+# This is a TIMER, separate from the decision logic below, so the pump
+# doesn't get cut off almost instantly by the next /detect call (which can
+# arrive every ~3-5s from the ESP32-CAM) before it had time to actually
+# dispense anything.
 FERTILIZE_PUMP_DURATION_SECONDS = 10
 
 fertilize_tracker = {
     "last_given": None
 }
 
+# Set to True by /detect when stress/disease is seen but soil was too dry to
+# fertilize at that moment. Cleared once fertilizer actually fires, so the
+# next scan (once soil is wet enough) can still act on it instead of losing
+# the window.
 pending_fertilize = False
+
+# Timestamp (Malaysia time) until which the fertilizer relay should stay ON.
+# None / in the past = pump should be OFF.
 fertilize_on_until = None
 
 def trigger_fertilize_pump():
+    """Start (or restart) the 10s ON window for the fertilizer relay."""
     global fertilize_on_until
     fertilize_on_until = get_malaysia_time() + timedelta(seconds=FERTILIZE_PUMP_DURATION_SECONDS)
 
 def fertilize_pump_is_on():
+    """The ACTUAL relay state the ESP32 actuator should follow - timer based,
+    not tied to whatever the latest /detect decision cycle computed."""
     return fertilize_on_until is not None and get_malaysia_time() < fertilize_on_until
 
 def fertilize_pump_seconds_remaining():
@@ -251,12 +283,21 @@ latest_image_timestamp = None
 sensor_history = []
 max_history = 100
 
-# NEW: keeps the raw per-box detections (class idx, name, confidence) from
-# the MOST RECENT full analysis, purely for debugging via /debug/last-detections.
+# Keeps the raw per-box detections (class idx, name, confidence) from the
+# MOST RECENT full analysis, purely for debugging via /debug/last-detections.
 last_raw_detections = []
 
-# ========== FRAME THROTTLING ==========
-ANALYZE_EVERY_N_FRAMES = 3
+# ========== FRAME THROTTLING (fast image updates, slower heavy analysis) ==========
+# The ESP32-CAM can only ever send still JPEGs (no real video encoder on the
+# chip) - but it can send them fast (e.g. every 1s) so the dashboard LOOKS
+# like a live video feed (MJPEG-style). Running the YOLO model on EVERY
+# single frame at that rate is too heavy for a free-tier server and causes
+# lag/timeouts. So: the raw image is updated and shown on EVERY frame the
+# ESP32 sends, but the expensive analysis (YOLO detection, fertilizer
+# decision) only runs once every ANALYZE_EVERY_N_FRAMES frames. Between
+# analysis frames we reuse the last known result so decisions don't just
+# disappear.
+ANALYZE_EVERY_N_FRAMES = 3  # e.g. ESP32 sends every 1s -> full analysis runs every ~3s
 
 frame_counter = 0
 last_leaf_analysis = None
@@ -264,6 +305,9 @@ last_diagnosis = "Waiting for first analysis..."
 last_disease_confidence = 0.0
 last_has_disease = False
 
+# Global state shared with the ESP32 Node (Pump actuator)
+# NOTE: action_fertilize is ONLY ever written by /detect (ESP32-CAM).
+# /soil (plain ESP32) is only allowed to touch action_water + soil fields.
 current_pump_status = {
     "action_water": False,
     "action_fertilize": False,
@@ -286,11 +330,11 @@ def health_check():
     }), 200
 
 # ---- Debug endpoint: confirm the model's real class mapping + resolved
-# stressed index straight from the browser, no need to dig Render/Cloud Run logs.
+# stressed index straight from the browser, no need to dig through logs.
 @app.route('/debug/model-info', methods=['GET'])
 def debug_model_info():
     if not model_available:
-        return jsonify({"model_loaded": False, "message": "Model not loaded, using OpenCV fallback"}), 200
+        return jsonify({"model_loaded": False, "message": "Model not loaded"}), 200
     return jsonify({
         "model_loaded": True,
         "class_names": yolo_model.names,
@@ -319,6 +363,7 @@ def detect_plant():
         global latest_image_base64, latest_image_timestamp, current_pump_status, pending_fertilize
         global frame_counter, last_leaf_analysis, last_diagnosis, last_disease_confidence, last_has_disease
 
+        # Get sensor data from HTTP Headers (ESP32-CAM)
         soil_raw = request.headers.get('X-Soil-Raw', type=int, default=2500)
         soil_percent = request.headers.get('X-Soil-Percent', type=float, default=50.0)
 
@@ -326,18 +371,25 @@ def detect_plant():
         if not image_data:
             return jsonify({"error": "No image received"}), 400
 
+        # Decode image using OpenCV
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
             return jsonify({"error": "Failed to decode image"}), 400
 
+        # ========== FRAME THROTTLE DECISION ==========
+        # Every frame updates the live image, but the heavy YOLO analysis
+        # only actually runs every ANALYZE_EVERY_N_FRAMES frames (or
+        # immediately on the very first frame ever received).
         frame_counter += 1
         run_full_analysis = (last_leaf_analysis is None) or (frame_counter % ANALYZE_EVERY_N_FRAMES == 0)
 
         if run_full_analysis:
+            # ========== STEP 1: DIRECT YOLO LEAF DETECTION ==========
             leaf_analysis = analyze_leaf_health(img)
 
+            # ========== STEP 2: OVERALL DIAGNOSIS DERIVED FROM PER-LEAF RESULTS ==========
             if not leaf_analysis['is_plant_detected']:
                 diagnosis = "No Chili Plant Detected"
                 disease_confidence = 1.0
@@ -351,30 +403,46 @@ def detect_plant():
                 disease_confidence = 1.0 - leaf_analysis['stress_level']
                 has_disease = False
 
+            # Cache so skipped frames in between can reuse this result
             last_leaf_analysis = leaf_analysis
             last_diagnosis = diagnosis
             last_disease_confidence = disease_confidence
             last_has_disease = has_disease
         else:
+            # Skip the expensive YOLO work this frame - reuse the last known
+            # analysis so fertilizer/disease decisions stay consistent
+            # instead of resetting every frame.
             leaf_analysis = last_leaf_analysis
             diagnosis = last_diagnosis
             disease_confidence = last_disease_confidence
             has_disease = last_has_disease
 
+        # ========== STEP 3: SMART DECISION LOGIC ==========
         action_water = False
         action_fertilize = False
         alert_disease = False
         decision_reason = ""
 
         soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
+        # Plant-wide stress decision now based on the SHARE of leaves that
+        # are individually flagged as stressed, not a single whole-plant
+        # color average. See STRESSED_LEAF_PERCENT_THRESHOLD below.
         leaf_is_stressed = leaf_analysis['stressed_percent'] > STRESSED_LEAF_PERCENT_THRESHOLD
         needs_fertilizer = leaf_is_stressed or has_disease
 
+        # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
+        # Uses the SAME shared function as /soil, so a dose triggered by one
+        # node is recognised by the other and never double-counted.
         action_water, decision_reason = handle_water_logic(soil_percent)
 
+        # -------- FERTILIZER PUMP LOGIC (requires plant detection + 7-day cooldown) --------
+        # This block is the ONLY place in the whole app that is allowed to set
+        # action_fertilize. /soil must never touch it.
         if leaf_analysis['is_plant_detected']:
             if needs_fertilizer:
                 if soil_is_dry:
+                    # Can't fertilize dry soil right now, but don't lose the
+                    # signal - remember it so next wet-soil scan can still act.
                     pending_fertilize = True
                     decision_reason += " | Plant stressed/diseased but soil is dry -> fertilizer queued until soil is watered"
                 else:
@@ -388,6 +456,8 @@ def detect_plant():
                         f_info = get_fertilize_tracker_info()
                         decision_reason += f" | Plant stress/disease detected BUT fertilizer is still on cooldown, {f_info['days_remaining']} day(s) left before it can be given again"
             elif pending_fertilize and not soil_is_dry:
+                # Stress/disease from a PREVIOUS scan is still pending and soil
+                # has since become wet enough -> act on it now.
                 if can_fertilize_now():
                     action_fertilize = True
                     pending_fertilize = False
@@ -407,6 +477,7 @@ def detect_plant():
             if not action_water and not action_fertilize and not alert_disease:
                 decision_reason = "All parameters normal - Chili plant is healthy!"
         else:
+            # No plant detected (e.g. only the floor/wall is visible)
             diagnosis = "No Chili Plant Detected"
             disease_confidence = 1.0
             has_disease = False
@@ -415,12 +486,14 @@ def detect_plant():
             else:
                 decision_reason += " | (No plant detected in frame, but water was still given because the soil is dry)"
 
+        # ========== STEP 4: DRAW BOUNDING BOX (ONE PER LEAF) ==========
         processed_img = draw_detection_box(img, leaf_analysis, diagnosis)
 
         _, buffer = cv2.imencode('.jpg', processed_img)
         latest_image_base64 = base64.b64encode(buffer).decode('utf-8')
         latest_image_timestamp = get_malaysia_time().isoformat()
 
+        # Save status to share with the ESP32 Node
         current_pump_status = {
             "action_water": action_water,
             "action_fertilize": action_fertilize,
@@ -437,12 +510,16 @@ def detect_plant():
         else:
             plant_needs = "Optimal (No Action)"
 
+        # Save record to in-memory history.
+        # NOTE: "diagnosis" keeps the RAW diagnosis (e.g. "Chili Plant Stressed")
+        # so any future text-matching stays valid. The human-friendly summary
+        # is stored separately as "plant_needs" instead of overwriting diagnosis.
         record = {
             "timestamp": latest_image_timestamp,
             "soil_percent": soil_percent,
             "soil_raw": soil_raw,
-            "diagnosis": diagnosis,
-            "plant_needs": plant_needs,
+            "diagnosis": diagnosis,          # raw diagnosis, e.g. "Chili Plant Stressed"
+            "plant_needs": plant_needs,       # human-friendly summary for the dashboard
             "disease_confidence": disease_confidence,
             "leaf_stress": leaf_analysis['stress_level'],
             "leaf_color_normal": not leaf_analysis['color_abnormal'],
@@ -471,6 +548,13 @@ def detect_plant():
 
 @app.route('/soil', methods=['POST'])
 def receive_soil_data():
+    """
+    Receives soil moisture data directly from the plain ESP32 sensor node.
+    IMPORTANT: this endpoint only controls action_water. It must NEVER set
+    action_fertilize - that decision belongs solely to /detect (ESP32-CAM),
+    otherwise the two nodes end up racing to overwrite the same shared
+    current_pump_status dict.
+    """
     try:
         data = request.json
         soil_raw = data.get("soil_raw", 2500)
@@ -480,9 +564,15 @@ def receive_soil_data():
         last_confidence = sensor_history[-1]['disease_confidence'] if sensor_history else 0.0
         last_stress = sensor_history[-1]['leaf_stress'] if sensor_history else 0.0
 
+        # -------- WATER PUMP LOGIC (ignores detection, capped at 2x/day) --------
+        # Uses the SAME shared function as /detect, so a dose triggered by
+        # one node is recognised by the other and never double-counted.
         action_water, water_reason = handle_water_logic(soil_percent)
         current_pump_status["action_water"] = action_water
         current_pump_status["decision_reason"] = f"Soil data: {water_reason}"
+
+        # action_fertilize and alert_disease are intentionally left untouched
+        # here - they keep whatever /detect last decided.
 
         record = {
             "timestamp": get_malaysia_time().isoformat(),
@@ -504,6 +594,17 @@ def receive_soil_data():
 
 @app.route('/debug/reset-trackers', methods=['GET', 'POST'])
 def reset_trackers():
+    """
+    TESTING-ONLY ENDPOINT.
+    Resets the water pump daily limit (2x/day) and/or the fertilizer pump
+    7-day cooldown (+ pending_fertilize flag) so you can re-test the logic
+    instantly without waiting for the next day / next 7 days.
+
+    Usage:
+      - GET  /debug/reset-trackers                 -> resets BOTH trackers
+      - GET  /debug/reset-trackers?target=water     -> resets water pump only
+      - GET  /debug/reset-trackers?target=fertilize -> resets fertilizer pump only
+    """
     target = request.args.get('target', 'all')
 
     if target in ('all', 'water'):
@@ -521,6 +622,11 @@ def reset_trackers():
 
 @app.route('/pump-status', methods=['GET'])
 def get_pump_status():
+    """Endpoint read by the ESP32 Actuator Node for relay control + the Dashboard.
+    IMPORTANT: action_fertilize here is the TIMER-based live state (stays True
+    for FERTILIZE_PUMP_DURATION_SECONDS after triggering), NOT just whatever
+    the most recent /detect decision cycle happened to compute. This is what
+    stops the relay from flicking OFF again before it had time to dispense."""
     status = dict(current_pump_status)
     status["action_fertilize"] = fertilize_pump_is_on()
     status["water_tracker"] = get_water_tracker_info()
@@ -564,23 +670,27 @@ def get_stats():
 
 # ========== PROCESSING FUNCTIONS ==========
 
-MIN_LEAF_AREA = 800  # NOTE: no longer used - kept for reference (old OpenCV contour approach)
+MIN_LEAF_AREA = 800  # NOTE: no longer used - was for the old OpenCV contour
+                      # approach, kept here in case that fallback is needed later
 
+# Whole-plant decision: fertilize if this % (or more) of DETECTED leaves are
+# individually stressed.
 STRESSED_LEAF_PERCENT_THRESHOLD = 40.0
 
 def analyze_leaf_health(img):
     """
     Runs the trained YOLO object-DETECTION model DIRECTLY on the full frame.
     The model finds AND localizes each individual leaf (its own bounding box)
-    and classifies it in one pass.
+    and classifies it in one pass - matches exactly what the Colab test
+    notebook showed (many tight boxes, one per leaf, each labelled 0/1).
 
     FIXED (v2): "stressed" is no longer hardcoded to class index 1. It's
     matched by class NAME once at startup (STRESSED_CLASS_IDX), because
     Roboflow/YOLO class order depends on the order classes were created in
-    the labeling project, not on what seems logical. Confidence threshold is
-    also passed explicitly (DETECT_CONF_THRESHOLD) instead of relying on the
-    ultralytics default of 0.25, which can silently drop valid low-confidence
-    "stressed" boxes before this code ever sees them.
+    the labeling project, not on what seems logical. The confidence
+    threshold is also passed explicitly (DETECT_CONF_THRESHOLD) instead of
+    relying on the ultralytics default of 0.25, which can silently drop
+    valid low-confidence "stressed" boxes before this code ever sees them.
     """
     global last_raw_detections
     leaves = []
@@ -596,7 +706,8 @@ def analyze_leaf_health(img):
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
                 bw, bh = max(1, x2 - x1), max(1, y2 - y1)
 
-                # Match by class NAME resolved at startup, not a hardcoded index
+                # Match by class INDEX resolved by NAME at startup, not a
+                # hardcoded assumption.
                 is_stressed = (pred_class_idx == STRESSED_CLASS_IDX)
                 leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
 
@@ -618,6 +729,7 @@ def analyze_leaf_health(img):
 
     last_raw_detections = raw_detections_this_frame
 
+    # Largest leaves first (usually the most reliable/least noisy)
     leaves.sort(key=lambda l: -l["area"])
 
     num_leaves = len(leaves)
@@ -628,18 +740,20 @@ def analyze_leaf_health(img):
     is_plant_detected = num_leaves > 0
 
     return {
-        "leaves": leaves,
+        "leaves": leaves,                          # list of per-leaf dicts (bbox, stress_level, is_stressed)
         "num_leaves": num_leaves,
         "num_stressed": num_stressed,
         "stressed_percent": float(stressed_percent),
-        "stress_level": float(avg_stress_level),
+        "stress_level": float(avg_stress_level),    # kept for backward-compat (used by /stats)
         "color_abnormal": stressed_percent > STRESSED_LEAF_PERCENT_THRESHOLD,
-        "green_ratio": 0.0,
+        "green_ratio": 0.0,                         # no longer computed - YOLO detects leaves directly now
         "is_plant_detected": bool(is_plant_detected)
     }
 
 def draw_detection_box(img, leaf_analysis, diagnosis):
-    """Draws ONE box PER detected leaf (red = stressed, green = healthy)."""
+    """Draws ONE box PER detected leaf (red = stressed, green = healthy),
+    each labelled with that leaf's own stress %, plus a summary bar at the
+    top showing total leaves and overall stressed percentage."""
     output = img.copy()
     h, w, _ = output.shape
 
@@ -650,10 +764,13 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
             color = (0, 0, 255) if is_stressed else (0, 200, 0)  # BGR: red / green
             cv2.rectangle(output, (x, y), (x + bw, y + bh), color, 2)
 
+            # Only show a percentage when the leaf is flagged stressed - "OK 0%"
+            # was confusing since 0% reads like a measurement, not a status.
             label = f"STRESS {leaf['stress_level'] * 100:.0f}%" if is_stressed else "OK"
             label_y = y - 8 if y - 8 > 12 else y + bh + 16
             cv2.putText(output, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
+        # Summary strip across the top of the frame
         summary = (f"Leaves: {leaf_analysis['num_leaves']}  |  "
                    f"Stressed: {leaf_analysis['num_stressed']} "
                    f"({leaf_analysis['stressed_percent']:.0f}%)")

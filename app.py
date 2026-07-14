@@ -14,6 +14,10 @@ disease-model analysis only runs every ANALYZE_EVERY_N_FRAMES frames*
 is cropped and classified individually by a trained YOLOv8 classification
 model (healthy/stressed) instead of the old yellow-pixel-ratio heuristic
 and the old TensorFlow .h5 model*
+*Version: Fixed class matching - match Roboflow prediction by class INDEX
+(0 = Healthy, 1 = Stressed) instead of a fragile string comparison against
+the literal word "stressed", which was silently failing and causing every
+leaf to be reported as healthy regardless of what the model actually saw*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -56,6 +60,7 @@ try:
         import torch
         device = 0 if torch.cuda.is_available() else 'cpu'
         logger.info(f"YOLO (.pt) classification model loaded successfully! Using device: {device}")
+        logger.info(f"Model class names/mapping: {yolo_model.names}")
         model_available = True
     else:
         logger.warning(f"{MODEL_PATH} not found. Using OpenCV fallback (yellow-ratio heuristic).")
@@ -645,9 +650,15 @@ def analyze_leaf_health(img):
                 result = yolo_model(leaf_crop, verbose=False, device=device)
                 if len(result[0].boxes) > 0:
                     top_box = result[0].boxes[0]  # box confidence paling tinggi
-                    pred_class = result[0].names[int(top_box.cls[0])]
+                    pred_class_idx = int(top_box.cls[0])
                     pred_conf = float(top_box.conf[0])
-                    is_stressed = (pred_class == "stressed")
+                    # Match by class INDEX (not string name) - Roboflow mapping
+                    # for this model: 0 = Healthy, 1 = Stressed. The old code
+                    # compared result[0].names[idx] == "stressed", which
+                    # silently failed whenever Roboflow's actual class name
+                    # string didn't match exactly (different case, wording,
+                    # etc), causing every leaf to be reported as healthy.
+                    is_stressed = (pred_class_idx == 1)
                     leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
                 else:
                     # takde apa detect dalam crop ni — anggap healthy

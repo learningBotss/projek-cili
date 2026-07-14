@@ -4,8 +4,5 @@ numpy==1.24.3
 opencv-python-headless==4.8.0.76
 Werkzeug==2.3.7
 gunicorn==21.2.0
-Pillow==10.0.0
 pytz==2023.3.post1
 onnxruntime==1.18.1
-onnx==1.16.1
-ultralytics==8.2.103

@@ -1,10 +1,29 @@
 """
 CHILI STRESS DETECTION BACKEND - PYTHON FLASK
 UiTM ITT569 IoT Final Project - CDCS259
-*Version: Multi-leaf detection fixes - watershed separation for touching
-leaves, shape filtering to reject non-leaf green blobs, hide 0%
-percentage labels, AND fixed YOLO class index mismatch (match by class
-NAME instead of assuming index 1 = Stressed)*
+*Version: Fixed fertilizer logic - single source of truth (ESP32-CAM /detect only)*
+*/soil endpoint no longer overwrites action_fertilize -> prevents the two ESP32
+nodes from fighting over the same shared status dict*
+*Version: Multi-leaf detection - detects EACH leaf as its own bounding box
+and reports a per-leaf + overall stressed-percentage instead of one box
+for the whole plant*
+*Version: Frame throttling - image preview updates on EVERY frame the
+ESP32-CAM sends (fast, feels like live video), but the heavy leaf-contour +
+disease-model analysis only runs every ANALYZE_EVERY_N_FRAMES frames*
+*Version: YOLO classification - each detected leaf blob (from OpenCV contour)
+is cropped and classified individually by a trained YOLOv8 classification
+model (healthy/stressed) instead of the old yellow-pixel-ratio heuristic
+and the old TensorFlow .h5 model*
+*Version: FIXED class matching (v2) - no longer hardcodes "0 = Healthy,
+1 = Stressed". Roboflow/YOLO assigns class indices based on whatever order
+classes were created in the labeling project, which is NOT guaranteed to
+match that assumption - this was silently causing every leaf to be reported
+as healthy regardless of what the model actually saw. Now the "stressed"
+index is resolved ONCE at startup by matching the class NAME (see
+STRESSED_CLASS_IDX below), and the detection confidence threshold is
+explicit + tunable instead of relying on the ultralytics default (0.25),
+which can silently drop valid low-confidence "stressed" boxes entirely
+before they ever reach this code.*
 """
 
 from flask import Flask, request, jsonify, render_template, send_file
@@ -27,31 +46,45 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Set Malaysia timezone
 MY_TIMEZONE = pytz.timezone('Asia/Kuala_Lumpur')
 
 def get_malaysia_time():
     return datetime.now(MY_TIMEZONE)
 
+# ========== LOAD YOLO DETECTION MODEL (.pt via ultralytics) ==========
+# Now running on Cloud Run with an NVIDIA L4 GPU + 16GB RAM, so we can go
+# back to the full ultralytics + torch stack and even use GPU acceleration
+# for inference - no more need for the RAM-saving raw onnxruntime workaround
+# from the Render free-tier days.
 MODEL_PATH = "best.pt"
 
-# ---- NEW: figure out which class index actually means "stressed" by
-# reading the model's own name mapping, instead of hardcoding index==1.
-# YOLO classification models assign indices based on the ALPHABETICAL
-# ORDER of your training folder names, which may not match what you
-# expect (e.g. "Healthy_Leaf"/"Stressed_Leaf" vs "healthy"/"stressed").
+# Confidence threshold passed explicitly to yolo_model(). ultralytics
+# defaults to 0.25 if not specified - that's a reasonable general default,
+# but if your "Stressed" class tends to predict with lower confidence
+# (common with smaller/imbalanced training sets), valid stressed boxes can
+# get silently filtered out before they even reach this code's box loop.
+# Lower this (e.g. 0.15) if stress still isn't showing up after the class
+# index fix below, then raise it again once you confirm detection works,
+# to avoid too many false positives.
+DETECT_CONF_THRESHOLD = 0.20
+
 STRESSED_CLASS_IDX = None
 HEALTHY_CLASS_IDX = None
 
 try:
     if os.path.exists(MODEL_PATH):
         yolo_model = YOLO(MODEL_PATH)
+        # Use GPU if available (device 0 = first GPU), otherwise falls back to CPU
         import torch
         device = 0 if torch.cuda.is_available() else 'cpu'
-        logger.info(f"YOLO (.pt) classification model loaded successfully! Using device: {device}")
+        logger.info(f"YOLO (.pt) model loaded successfully! Using device: {device}")
         logger.info(f"Model class names/mapping: {yolo_model.names}")
 
-        # Auto-detect which index is "stressed" vs "healthy" by name,
-        # instead of assuming 0 = Healthy, 1 = Stressed.
+        # ---- Resolve which index is actually "stressed" by NAME instead of
+        # hardcoding index 1. Roboflow/YOLO class order depends on the order
+        # classes were created in the labeling project - it is NOT guaranteed
+        # to be 0=Healthy, 1=Stressed just because that seems logical.
         for idx, name in yolo_model.names.items():
             name_lower = str(name).lower()
             if "stress" in name_lower or "disease" in name_lower or "unhealthy" in name_lower:
@@ -61,10 +94,9 @@ try:
 
         if STRESSED_CLASS_IDX is None:
             logger.warning(
-                "Could not auto-detect 'stressed' class by name from "
-                f"{yolo_model.names} - falling back to index 1 as stressed. "
-                "Check /debug/model-info and rename your training folders "
-                "to include 'healthy'/'stressed' if this looks wrong."
+                f"Could not auto-detect 'stressed' class by name from {yolo_model.names} "
+                "- falling back to index 1. Check /debug/model-info and rename your "
+                "Roboflow/training classes to include 'healthy'/'stressed' if this is wrong."
             )
             STRESSED_CLASS_IDX = 1
 
@@ -81,10 +113,18 @@ except Exception as e:
     model_available = False
     device = 'cpu'
 
+# ========== SENSOR THRESHOLDS ==========
+# NOTE: Following the new ESP32 mapping: a LOW percentage (< 30%) means dry soil
 MOISTURE_THRESHOLD_DRY = 30.0
+
+# ========== WATER PUMP: DAILY LIMIT (2x/DAY) ==========
 WATER_DAILY_LIMIT = 2
 
-water_tracker = {"date": None, "count": 0, "history_times": []}
+water_tracker = {
+    "date": None,
+    "count": 0,
+    "history_times": []
+}
 
 def _reset_water_tracker_if_new_day():
     today = get_malaysia_time().date()
@@ -121,6 +161,10 @@ def reset_water_tracker():
 watering_session_active = False
 
 def handle_water_logic(soil_percent):
+    """
+    SINGLE SOURCE OF TRUTH for water pump decisions - called by BOTH /detect
+    and /soil so the two ESP32 nodes never diverge or double-count doses.
+    """
     global watering_session_active
     soil_is_dry = soil_percent < MOISTURE_THRESHOLD_DRY
 
@@ -140,10 +184,14 @@ def handle_water_logic(soil_percent):
             return False, "Soil now moist - watering session complete, pump OFF"
         return False, "Soil is moist - watering not needed."
 
+# ========== FERTILIZER PUMP: 7-DAY COOLDOWN ==========
 FERTILIZE_COOLDOWN_DAYS = 7
 FERTILIZE_PUMP_DURATION_SECONDS = 10
 
-fertilize_tracker = {"last_given": None}
+fertilize_tracker = {
+    "last_given": None
+}
+
 pending_fertilize = False
 fertilize_on_until = None
 
@@ -172,9 +220,12 @@ def record_fertilize_given():
 def get_fertilize_tracker_info():
     if fertilize_tracker["last_given"] is None:
         return {
-            "last_given": None, "days_since": None,
-            "cooldown_days": FERTILIZE_COOLDOWN_DAYS, "can_fertilize": True,
-            "days_remaining": 0.0, "pending": pending_fertilize
+            "last_given": None,
+            "days_since": None,
+            "cooldown_days": FERTILIZE_COOLDOWN_DAYS,
+            "can_fertilize": True,
+            "days_remaining": 0.0,
+            "pending": pending_fertilize
         }
     elapsed = get_malaysia_time() - fertilize_tracker["last_given"]
     days_since = elapsed.total_seconds() / 86400.0
@@ -194,12 +245,19 @@ def reset_fertilize_tracker():
     pending_fertilize = False
     fertilize_on_until = None
 
+# ========== DATA STORAGE ==========
 latest_image_base64 = None
 latest_image_timestamp = None
 sensor_history = []
 max_history = 100
 
+# NEW: keeps the raw per-box detections (class idx, name, confidence) from
+# the MOST RECENT full analysis, purely for debugging via /debug/last-detections.
+last_raw_detections = []
+
+# ========== FRAME THROTTLING ==========
 ANALYZE_EVERY_N_FRAMES = 3
+
 frame_counter = 0
 last_leaf_analysis = None
 last_diagnosis = "Waiting for first analysis..."
@@ -213,6 +271,8 @@ current_pump_status = {
     "decision_reason": "Waiting for initial data..."
 }
 
+# ========== ROUTES ==========
+
 @app.route('/', methods=['GET'])
 def index():
     return render_template('dashboard.html')
@@ -225,8 +285,8 @@ def health_check():
         "timestamp": get_malaysia_time().isoformat()
     }), 200
 
-# ---- NEW: debug endpoint so you can check the model's real class
-# mapping straight from the browser, no need to dig through Render logs.
+# ---- Debug endpoint: confirm the model's real class mapping + resolved
+# stressed index straight from the browser, no need to dig Render/Cloud Run logs.
 @app.route('/debug/model-info', methods=['GET'])
 def debug_model_info():
     if not model_available:
@@ -238,7 +298,19 @@ def debug_model_info():
         "resolved_stressed_class_name": yolo_model.names.get(STRESSED_CLASS_IDX),
         "resolved_healthy_class_idx": HEALTHY_CLASS_IDX,
         "resolved_healthy_class_name": yolo_model.names.get(HEALTHY_CLASS_IDX) if HEALTHY_CLASS_IDX is not None else None,
+        "detect_conf_threshold": DETECT_CONF_THRESHOLD,
         "device": str(device)
+    }), 200
+
+# ---- Debug endpoint: see the RAW boxes from the most recent full analysis
+# (every class idx/name/confidence YOLO actually returned), so you can tell
+# whether the model just isn't detecting stress at all vs. the code
+# mis-mapping a correct detection.
+@app.route('/debug/last-detections', methods=['GET'])
+def debug_last_detections():
+    return jsonify({
+        "count": len(last_raw_detections),
+        "detections": last_raw_detections
     }), 200
 
 @app.route('/detect', methods=['POST'])
@@ -492,168 +564,59 @@ def get_stats():
 
 # ========== PROCESSING FUNCTIONS ==========
 
-MIN_LEAF_AREA = 800  # tuned for full VGA (640x480) resolution
-
-# ---- shape filters to reject non-leaf green blobs ----
-# Leaves are roughly oval/elongated blobs with a fairly "filled-in" outline.
-# Random green background clutter (walls, tarps, reflections) tends to be
-# either very jagged (low solidity) or a shape/aspect ratio that doesn't
-# look leaf-like at all. Tune these if real leaves get rejected.
-MIN_SOLIDITY = 0.55        # area / convex_hull_area - rejects jagged/irregular blobs
-MIN_ASPECT_RATIO = 0.15    # width/height - rejects super thin slivers
-MAX_ASPECT_RATIO = 5.0     # width/height - rejects super wide/flat strips
-
-# ---- watershed tuning ----
-# Fraction of the max distance-transform value used to mark "sure foreground"
-# peaks (one peak per leaf). Lower = more/smaller separate leaves detected
-# (good when leaves overlap a lot); higher = fewer, larger merges.
-WATERSHED_PEAK_RATIO = 0.35
+MIN_LEAF_AREA = 800  # NOTE: no longer used - kept for reference (old OpenCV contour approach)
 
 STRESSED_LEAF_PERCENT_THRESHOLD = 40.0
 
-def _is_leaf_shaped(contour, area):
-    """Reject blobs that don't look like a leaf (background clutter, shadows,
-    reflections, edges of pots/wires etc that happen to be green)."""
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
-    if hull_area <= 0:
-        return False
-    solidity = area / hull_area
-    if solidity < MIN_SOLIDITY:
-        return False
-
-    x, y, bw, bh = cv2.boundingRect(contour)
-    if bh == 0:
-        return False
-    aspect_ratio = bw / float(bh)
-    if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
-        return False
-
-    return True
-
-def _segment_leaf_blobs(mask_clean):
-    """Separates touching/overlapping leaves into individual blobs using
-    watershed (distance transform), instead of relying on plain external
-    contours which merge every touching leaf into ONE giant contour/box.
-
-    Returns a list of individual leaf masks (each a single-blob uint8 mask
-    the same size as mask_clean), one per separated leaf region.
-    """
-    dist = cv2.distanceTransform(mask_clean, cv2.DIST_L2, 5)
-    if dist.max() <= 0:
-        return []
-
-    _, sure_fg = cv2.threshold(dist, WATERSHED_PEAK_RATIO * dist.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
-
-    num_markers, markers = cv2.connectedComponents(sure_fg)
-    if num_markers <= 1:
-        return []  # nothing distinct found
-
-    unknown = cv2.subtract(mask_clean, sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-
-    # watershed needs a 3-channel image
-    color_for_watershed = cv2.cvtColor(mask_clean, cv2.COLOR_GRAY2BGR)
-    cv2.watershed(color_for_watershed, markers)
-
-    leaf_masks = []
-    for label in range(2, num_markers + 1):  # label 1 = background
-        leaf_mask = np.uint8(markers == label) * 255
-        if cv2.countNonZero(leaf_mask) > 0:
-            leaf_masks.append(leaf_mask)
-
-    return leaf_masks
-
 def analyze_leaf_health(img):
     """
-    Segments the frame into green (leaf) regions, SEPARATES touching leaves
-    with watershed so each gets its own box, FILTERS OUT non-leaf-shaped
-    green blobs, then crops + classifies each real leaf with the YOLO model.
+    Runs the trained YOLO object-DETECTION model DIRECTLY on the full frame.
+    The model finds AND localizes each individual leaf (its own bounding box)
+    and classifies it in one pass.
+
+    FIXED (v2): "stressed" is no longer hardcoded to class index 1. It's
+    matched by class NAME once at startup (STRESSED_CLASS_IDX), because
+    Roboflow/YOLO class order depends on the order classes were created in
+    the labeling project, not on what seems logical. Confidence threshold is
+    also passed explicitly (DETECT_CONF_THRESHOLD) instead of relying on the
+    ultralytics default of 0.25, which can silently drop valid low-confidence
+    "stressed" boxes before this code ever sees them.
     """
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    lower_green = np.array([35, 35, 35])
-    upper_green = np.array([85, 255, 255])
-    mask_green = cv2.inRange(hsv, lower_green, upper_green)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask_clean = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    total_pixels = img.shape[0] * img.shape[1]
-    green_pixels = cv2.countNonZero(mask_clean)
-    green_ratio = green_pixels / total_pixels
-
-    # ---- Try to separate touching leaves first (watershed) ----
-    leaf_masks = _segment_leaf_blobs(mask_clean)
-
-    # Build the list of candidate contours to evaluate: prefer the
-    # watershed-separated blobs (many small leaves); fall back to plain
-    # external contours only if watershed found nothing usable (e.g. a
-    # single isolated leaf with no touching neighbours).
-    candidate_contours = []
-    if leaf_masks:
-        for lm in leaf_masks:
-            cnts, _ = cv2.findContours(lm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            candidate_contours.extend(cnts)
-    else:
-        candidate_contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+    global last_raw_detections
     leaves = []
-    for c in candidate_contours:
-        area = cv2.contourArea(c)
-        if area < MIN_LEAF_AREA:
-            continue  # too small - likely noise, not a real leaf
+    raw_detections_this_frame = []
 
-        if not _is_leaf_shaped(c, area):
-            continue  # doesn't look like a leaf - skip (don't box it)
+    if model_available:
+        try:
+            result = yolo_model(img, verbose=False, device=device, conf=DETECT_CONF_THRESHOLD)[0]
+            for box in result.boxes:
+                pred_class_idx = int(box.cls[0])
+                pred_conf = float(box.conf[0])
+                pred_class_name = yolo_model.names.get(pred_class_idx, str(pred_class_idx))
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
+                bw, bh = max(1, x2 - x1), max(1, y2 - y1)
 
-        x, y, bw, bh = cv2.boundingRect(c)
-        leaf_crop = img[y:y + bh, x:x + bw]
+                # Match by class NAME resolved at startup, not a hardcoded index
+                is_stressed = (pred_class_idx == STRESSED_CLASS_IDX)
+                leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
 
-        leaf_stress_level = 0.0
-        is_stressed = False
+                leaves.append({
+                    "bbox": (x1, y1, bw, bh),
+                    "area": float(bw * bh),
+                    "stress_level": float(leaf_stress_level),
+                    "is_stressed": is_stressed
+                })
 
-        if model_available and leaf_crop.size > 0:
-            try:
-                result = yolo_model(leaf_crop, verbose=False, device=device)
-                # IMPORTANT: best.pt is a CLASSIFICATION model, not a
-                # detection model - ultralytics returns classification
-                # results in result[0].probs (top1 / top1conf), NOT
-                # result[0].boxes. .boxes is always empty for a -cls model.
-                #
-                # FIXED: previously this hardcoded "class index 1 =
-                # Stressed", but YOLO assigns indices based on the
-                # ALPHABETICAL ORDER of your training folder names - if
-                # your folders weren't literally "0_healthy"/"1_stressed"
-                # or similar, index 1 might actually BE healthy, silently
-                # forcing every leaf to read as healthy (0% stress) no
-                # matter what the model saw. Now we match by the class
-                # NAME resolved once at startup (STRESSED_CLASS_IDX),
-                # which is safe regardless of alphabetical ordering.
-                probs = result[0].probs
-                if probs is not None:
-                    pred_class_idx = int(probs.top1)
-                    pred_conf = float(probs.top1conf)
-                    is_stressed = (pred_class_idx == STRESSED_CLASS_IDX)
-                    leaf_stress_level = pred_conf if is_stressed else (1.0 - pred_conf)
-                else:
-                    is_stressed = False
-                    leaf_stress_level = 0.0
-            except Exception as e:
-                logger.warning(f"YOLO predict failed on leaf crop: {str(e)}")
-        else:
-            leaf_stress_level = 0.0
-            is_stressed = False
+                raw_detections_this_frame.append({
+                    "class_idx": pred_class_idx,
+                    "class_name": pred_class_name,
+                    "confidence": round(pred_conf, 3),
+                    "matched_as_stressed": is_stressed
+                })
+        except Exception as e:
+            logger.warning(f"YOLO detect failed on frame: {str(e)}")
 
-        leaves.append({
-            "bbox": (x, y, bw, bh),
-            "area": float(area),
-            "stress_level": float(leaf_stress_level),
-            "is_stressed": is_stressed
-        })
+    last_raw_detections = raw_detections_this_frame
 
     leaves.sort(key=lambda l: -l["area"])
 
@@ -662,7 +625,7 @@ def analyze_leaf_health(img):
     stressed_percent = (num_stressed / num_leaves * 100.0) if num_leaves > 0 else 0.0
     avg_stress_level = (sum(l["stress_level"] for l in leaves) / num_leaves) if num_leaves > 0 else 0.0
 
-    is_plant_detected = num_leaves > 0 or green_ratio > 0.05
+    is_plant_detected = num_leaves > 0
 
     return {
         "leaves": leaves,
@@ -671,15 +634,12 @@ def analyze_leaf_health(img):
         "stressed_percent": float(stressed_percent),
         "stress_level": float(avg_stress_level),
         "color_abnormal": stressed_percent > STRESSED_LEAF_PERCENT_THRESHOLD,
-        "green_ratio": float(green_ratio),
-        "is_plant_detected": bool(is_plant_detected),
-        "mask_green": mask_clean
+        "green_ratio": 0.0,
+        "is_plant_detected": bool(is_plant_detected)
     }
 
 def draw_detection_box(img, leaf_analysis, diagnosis):
-    """Draws ONE box PER detected leaf (red = stressed, green = healthy).
-    Percentage is hidden when stress_level is ~0% so the label just reads
-    "OK" instead of "OK 0%"."""
+    """Draws ONE box PER detected leaf (red = stressed, green = healthy)."""
     output = img.copy()
     h, w, _ = output.shape
 
@@ -690,13 +650,7 @@ def draw_detection_box(img, leaf_analysis, diagnosis):
             color = (0, 0, 255) if is_stressed else (0, 200, 0)  # BGR: red / green
             cv2.rectangle(output, (x, y), (x + bw, y + bh), color, 2)
 
-            pct = leaf['stress_level'] * 100
-            if pct < 1.0:
-                # Don't show a misleading "0%" - just show the state.
-                label = "STRESS" if is_stressed else "OK"
-            else:
-                label = f"{'STRESS' if is_stressed else 'OK'} {pct:.0f}%"
-
+            label = f"STRESS {leaf['stress_level'] * 100:.0f}%" if is_stressed else "OK"
             label_y = y - 8 if y - 8 > 12 else y + bh + 16
             cv2.putText(output, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 

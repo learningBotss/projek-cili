@@ -47,7 +47,7 @@ def get_malaysia_time():
 # back to the full ultralytics + torch stack and even use GPU acceleration
 # for inference - no more need for the RAM-saving raw onnxruntime workaround
 # from the Render free-tier days.
-MODEL_PATH = "yolov8n.pt"
+MODEL_PATH = "yolo26n.pt"
 
 try:
     if os.path.exists(MODEL_PATH):
